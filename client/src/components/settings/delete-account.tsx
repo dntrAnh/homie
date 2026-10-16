@@ -52,6 +52,10 @@ export function DeleteAccount() {
         description="Homie cannot restore your account or memories after deletion."
         confirmLabel="Delete permanently"
         confirmDisabled={typed !== "DELETE" || !understood}
+        onClose={() => {
+          setTyped("")
+          setUnderstood(false)
+        }}
         onConfirm={async () => {
           await remove.mutateAsync()
           signOut()

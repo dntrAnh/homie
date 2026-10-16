@@ -179,12 +179,15 @@ function SettingsForm({ profile }: { profile: Profile }) {
               onChange={(e) => setTimezone(e.target.value)}
               className="bg-muted focus-visible:border-ring focus-visible:ring-ring/50 h-12 w-full appearance-none rounded-lg border pr-10 pl-11 text-base outline-none focus-visible:ring-3 md:text-[15px]"
             >
-              {ZONES.map((zone) => (
-                <option key={zone} value={zone}>
-                  {zoneLabel(zone)}
-                  {zone === browserZone ? " (this device)" : ""}
-                </option>
-              ))}
+              {/* Some runtimes omit zones like "UTC" (the server default); keep the saved one selectable. */}
+              {(ZONES.includes(timezone) ? ZONES : [timezone, ...ZONES]).map(
+                (zone) => (
+                  <option key={zone} value={zone}>
+                    {zoneLabel(zone)}
+                    {zone === browserZone ? " (this device)" : ""}
+                  </option>
+                ),
+              )}
             </select>
             <ChevronDown
               className="text-muted-foreground pointer-events-none absolute top-1/2 right-4 size-4 -translate-y-1/2"

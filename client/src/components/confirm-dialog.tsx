@@ -24,6 +24,7 @@ export function ConfirmDialog({
   pendingLabel = "Deleting…",
   confirmDisabled = false,
   onConfirm,
+  onClose,
   children,
 }: {
   trigger: React.ComponentProps<typeof AlertDialogTrigger>["render"]
@@ -33,16 +34,23 @@ export function ConfirmDialog({
   pendingLabel?: string
   confirmDisabled?: boolean
   onConfirm: () => Promise<unknown>
+  /** Runs whenever the dialog closes (Cancel, Escape, outside click or success). */
+  onClose?: () => void
   children?: React.ReactNode
 }) {
   const [open, setOpen] = useState(false)
   const [pending, setPending] = useState(false)
 
+  function setOpenAndNotify(next: boolean) {
+    setOpen(next)
+    if (!next) onClose?.()
+  }
+
   async function confirm() {
     setPending(true)
     try {
       await onConfirm()
-      setOpen(false)
+      setOpenAndNotify(false)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "That didn't work.")
     } finally {
@@ -51,7 +59,10 @@ export function ConfirmDialog({
   }
 
   return (
-    <AlertDialog open={open} onOpenChange={(next) => !pending && setOpen(next)}>
+    <AlertDialog
+      open={open}
+      onOpenChange={(next) => !pending && setOpenAndNotify(next)}
+    >
       <AlertDialogTrigger render={trigger} />
       <AlertDialogContent>
         <AlertDialogHeader>
