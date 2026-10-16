@@ -102,11 +102,22 @@ export function MediaDialog({
                   className="bg-card focus-visible:border-ring focus-visible:ring-ring/50 h-12 w-full rounded-lg border px-3 text-base outline-none focus-visible:ring-3"
                 >
                   <option value="">Not attached</option>
-                  {memories.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.content.slice(0, 80)}
+                  {/* A stable option for the current link, so it survives memories loading,
+                      failing, or paging it out (removing a selected option resets the select). */}
+                  {item.memory_id && (
+                    <option value={item.memory_id}>
+                      {memories
+                        .find((m) => m.id === item.memory_id)
+                        ?.content.slice(0, 80) ?? "Current memory"}
                     </option>
-                  ))}
+                  )}
+                  {memories
+                    .filter((m) => m.id !== item.memory_id)
+                    .map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.content.slice(0, 80)}
+                      </option>
+                    ))}
                 </select>
               </div>
               <label className="flex min-h-11 items-start gap-3 text-sm">
