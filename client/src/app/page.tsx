@@ -1,17 +1,15 @@
 "use client"
 
-import { Mail, ShieldCheck, UserPlus } from "lucide-react"
-import Link from "next/link"
+import { ShieldCheck } from "lucide-react"
 import { useRouter } from "next/navigation"
 import { useEffect } from "react"
 
 import { AuthCard, AuthLayout } from "@/components/auth/auth-layout"
-import { buttonVariants } from "@/components/ui/button"
+import { Button } from "@/components/ui/button"
 import { useAuth } from "@/lib/auth"
-import { cn } from "@/lib/utils"
 
 export default function Welcome() {
-  const { session } = useAuth()
+  const { loading, session, error, signIn } = useAuth()
   const router = useRouter()
 
   useEffect(() => {
@@ -27,27 +25,23 @@ export default function Welcome() {
         <p className="text-muted-foreground mt-3 text-sm md:mt-5 md:text-[15px]">
           Sign in to see and manage everything Homie remembers for you.
         </p>
-        <Link
-          href="/sign-in"
-          className={cn(
-            buttonVariants({ size: "lg" }),
-            "mt-5 h-12 w-full text-[15px] md:mt-6",
-          )}
+        {/* Cognito's Hosted UI handles both sign-in and sign-up (plan Task 9). */}
+        <Button
+          size="lg"
+          disabled={loading}
+          onClick={signIn}
+          className="mt-5 h-12 w-full text-[15px] md:mt-6"
         >
-          <Mail aria-hidden /> Continue with email
-        </Link>
-        <div className="text-muted-foreground my-4 flex items-center gap-3 text-xs before:h-px before:flex-1 before:bg-current/25 after:h-px after:flex-1 after:bg-current/25">
-          New to Homie?
-        </div>
-        <Link
-          href="/create-account"
-          className={cn(
-            buttonVariants({ variant: "outline", size: "lg" }),
-            "h-12 w-full text-[15px]",
-          )}
-        >
-          <UserPlus aria-hidden /> Create an account
-        </Link>
+          Continue
+        </Button>
+        <p className="text-muted-foreground mt-3 text-center text-xs">
+          New to Homie? You can create an account on the next screen.
+        </p>
+        {error && (
+          <p role="alert" className="text-destructive mt-3 text-sm">
+            {error}
+          </p>
+        )}
         <p className="text-muted-foreground mt-5 hidden items-center gap-2 border-t pt-5 text-xs md:flex">
           <ShieldCheck className="text-accent-dark size-4" aria-hidden />
           Your memories stay private and can be edited or deleted anytime.
