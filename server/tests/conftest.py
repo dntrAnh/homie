@@ -1,12 +1,16 @@
 import json
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread, local
+from threading import Lock, Thread, local
 from typing import Any
+from uuid import uuid4
 
 import boto3
 import jwt
 import pytest
+from boto3.dynamodb.types import TypeDeserializer
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from moto import mock_aws
 
@@ -76,7 +80,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def ddb_table() -> Iterator[Any]:
+def ddb_table(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     with mock_aws():
         dynamodb = boto3.resource("dynamodb", region_name=settings.aws_region)
         table = dynamodb.create_table(
@@ -91,7 +95,73 @@ def ddb_table() -> Iterator[Any]:
             ],
             BillingMode="PAY_PER_REQUEST",
         )
+        # Moto 5.2.4 currently fails parsing DynamoDB TransactWriteItems. Keep
+        # transaction semantics in this fixture while the app uses the real API.
+        transaction_lock = Lock()
+        deserializer = TypeDeserializer()
+
+        def transact_write_items(
+            *, TransactItems: list[dict[str, Any]], **_: Any
+        ) -> dict[str, Any]:
+            with transaction_lock:
+                writes = [operation["Put"] for operation in TransactItems]
+                decoded = [
+                    {key: deserializer.deserialize(value) for key, value in write["Item"].items()}
+                    for write in writes
+                ]
+                if any(
+                    table.get_item(Key={"pk": item["pk"], "sk": item["sk"]}).get("Item")
+                    for item in decoded
+                ):
+                    raise ClientError(
+                        {"Error": {"Code": "TransactionCanceledException"}}, "TransactWriteItems"
+                    )
+                for item in decoded:
+                    table.put_item(Item=item)
+            return {}
+
+        monkeypatch.setattr(table.meta.client, "transact_write_items", transact_write_items)
         yield table
+
+
+@pytest.fixture
+def ddb_local_table() -> Iterator[Any]:
+    endpoint_url = "http://127.0.0.1:8001"
+    client = boto3.client(
+        "dynamodb",
+        region_name=settings.aws_region,
+        endpoint_url=endpoint_url,
+        config=Config(connect_timeout=1, read_timeout=1, retries={"max_attempts": 0}),
+    )
+    try:
+        client.list_tables()
+    except BotoCoreError as exc:
+        pytest.skip(f"DynamoDB Local is not running at {endpoint_url}: {exc}")
+
+    table_name = f"homie-integration-{uuid4().hex}"
+    try:
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table = boto3.resource(
+            "dynamodb", region_name=settings.aws_region, endpoint_url=endpoint_url
+        ).Table(table_name)
+        table.wait_until_exists()
+        yield table
+    finally:
+        try:
+            client.delete_table(TableName=table_name)
+        except ClientError:
+            pass
 
 
 @pytest.fixture
