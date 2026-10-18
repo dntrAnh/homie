@@ -32,6 +32,11 @@ const SCOPE =
   process.env.NEXT_PUBLIC_COGNITO_SCOPE ??
   "openid email profile homie/mcp:tools"
 
+if (!AUTHORITY || !CLIENT_ID || !DOMAIN)
+  console.error(
+    "Cognito config missing: set NEXT_PUBLIC_COGNITO_* (see client/.env.example)",
+  )
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   // react-oidc-context skips the UserManager during SSR; only touch window in the browser.

@@ -34,8 +34,10 @@ export function ReminderDialog({
     create.mutate(
       {
         title: String(form.get("title")).trim(),
-        // datetime-local has no zone: send the user's local time as UTC ISO.
-        when: allDay ? when : new Date(when).toISOString(),
+        // Wall-clock time + the zone it was typed in; the server hands both to
+        // Google so the reminder lands at exactly this local time (DST-safe).
+        when,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         notes: String(form.get("notes") ?? "").trim() || undefined,
       },
       {
