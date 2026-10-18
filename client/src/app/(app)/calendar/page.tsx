@@ -18,33 +18,32 @@ import { mobileActionClass, PageHeader } from "@/components/page-header"
 import { Button } from "@/components/ui/button"
 import { type CalendarEvent, useEvents } from "@/lib/api/calendar"
 import { useConnectGoogle, useGoogleStatus } from "@/lib/api/google"
+import { useTimezone } from "@/lib/api/profile"
 import { cn } from "@/lib/utils"
 
 const DAYS = 14
 
-// dev-note: days and new reminders use the browser's zone; switch to PROFILE.timezone once
-// /api/me/profile is wired so Alexa and the dashboard always agree.
-function dayKey(date: Date) {
-  return date.toLocaleDateString("en-CA") // YYYY-MM-DD
-}
-
-function startOfToday() {
-  const d = new Date()
-  d.setHours(0, 0, 0, 0)
-  return d
+// Days are calendar dates in the profile's zone. Each is held as UTC noon of
+// that date and formatted in UTC, so the browser's own zone never shifts it.
+function dayKey(date: Date, timeZone = "UTC") {
+  return date.toLocaleDateString("en-CA", { timeZone }) // YYYY-MM-DD
 }
 
 function dayLabel(date: Date, index: number) {
   const md = date.toLocaleDateString(undefined, {
     month: "long",
     day: "numeric",
+    timeZone: "UTC",
   })
   const name =
     index === 0
       ? "Today"
       : index === 1
         ? "Tomorrow"
-        : date.toLocaleDateString(undefined, { weekday: "long" })
+        : date.toLocaleDateString(undefined, {
+            weekday: "long",
+            timeZone: "UTC",
+          })
   return `${name} · ${md}`
 }
 
@@ -53,11 +52,12 @@ export default function CalendarPage() {
   const events = useEvents(DAYS)
   const connect = useConnectGoogle()
   const [selected, setSelected] = useState(0)
+  const timeZone = useTimezone()
 
-  const today = startOfToday()
+  const today = new Date(`${dayKey(new Date(), timeZone)}T12:00:00Z`)
   const days = Array.from({ length: DAYS }, (_, i) => {
     const d = new Date(today)
-    d.setDate(today.getDate() + i)
+    d.setUTCDate(today.getUTCDate() + i)
     return d
   })
 
@@ -65,7 +65,7 @@ export default function CalendarPage() {
   for (const event of events.data ?? []) {
     const key = event.all_day
       ? event.start.slice(0, 10)
-      : dayKey(new Date(event.start))
+      : dayKey(new Date(event.start), timeZone)
     byDay.set(key, [...(byDay.get(key) ?? []), event])
   }
   const groups = days
@@ -151,16 +151,20 @@ export default function CalendarPage() {
                       <span className="md:hidden">
                         {date.toLocaleDateString(undefined, {
                           weekday: "short",
+                          timeZone: "UTC",
                         })}
                       </span>
                       <span className="hidden md:inline">Today</span>
                     </>
                   ) : (
-                    date.toLocaleDateString(undefined, { weekday: "short" })
+                    date.toLocaleDateString(undefined, {
+                      weekday: "short",
+                      timeZone: "UTC",
+                    })
                   )}
                 </span>
                 <span className="text-lg leading-none font-semibold md:font-normal">
-                  {date.getDate()}
+                  {date.getUTCDate()}
                 </span>
               </button>
             )

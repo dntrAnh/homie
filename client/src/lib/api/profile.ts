@@ -8,15 +8,16 @@ export type TravelMode = "DRIVE" | "WALK" | "TRANSIT" | "BICYCLE"
 
 export type Profile = {
   timezone: string
-  home?: { address: string; lat: number; lng: number } | null
+  /** lat/lng stay null until the server geocodes the address (Plan 2). */
+  home?: { address: string; lat: number | null; lng: number | null } | null
   travel_mode: TravelMode
 }
 
+/** Omitted fields keep their saved value; `home: null` clears it. */
 export type ProfileUpdate = {
-  timezone: string
-  travel_mode: TravelMode
-  /** Server geocodes it; empty string clears home. */
-  home_address: string
+  timezone?: string
+  travel_mode?: TravelMode
+  home?: { address: string } | null
 }
 
 export function useProfile() {
@@ -26,6 +27,16 @@ export function useProfile() {
     enabled,
     queryFn: ({ signal }) => request<Profile>("/api/me/profile", { signal }),
   })
+}
+
+const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+
+/**
+ * The zone dates are shown and reminders created in, so the dashboard and
+ * Alexa agree. Falls back to this device's zone until the profile loads.
+ */
+export function useTimezone() {
+  return useProfile().data?.timezone ?? browserZone
 }
 
 export function useUpdateProfile() {

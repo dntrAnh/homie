@@ -100,7 +100,11 @@ function SettingsForm({ profile }: { profile: Profile }) {
 
   function save() {
     update.mutate(
-      { timezone, travel_mode: mode, home_address: home.trim() },
+      {
+        timezone,
+        travel_mode: mode,
+        home: home.trim() ? { address: home.trim() } : null,
+      },
       {
         onSuccess: () => toast.success("Settings saved"),
         onError: (err) => toast.error(err.message),

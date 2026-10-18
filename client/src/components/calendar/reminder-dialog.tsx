@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { useCreateReminder } from "@/lib/api/calendar"
+import { useTimezone } from "@/lib/api/profile"
 
 export function ReminderDialog({
   trigger,
@@ -26,6 +27,7 @@ export function ReminderDialog({
   const [open, setOpen] = useState(false)
   const [allDay, setAllDay] = useState(false)
   const create = useCreateReminder()
+  const timezone = useTimezone()
 
   function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
@@ -37,7 +39,7 @@ export function ReminderDialog({
         // Wall-clock time + the zone it was typed in; the server hands both to
         // Google so the reminder lands at exactly this local time (DST-safe).
         when,
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        timezone,
         notes: String(form.get("notes") ?? "").trim() || undefined,
       },
       {
