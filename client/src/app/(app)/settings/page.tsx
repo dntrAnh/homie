@@ -21,6 +21,7 @@ import { toast } from "sonner"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { ErrorState, LoadingRows } from "@/components/data-states"
 import { mobileActionClass, PageHeader } from "@/components/page-header"
+import { PwaControls } from "@/components/pwa-controls"
 import { DeleteAccount } from "@/components/settings/delete-account"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -318,6 +319,8 @@ function SettingsForm({ profile }: { profile: Profile }) {
               </div>
             </div>
           </section>
+
+          <PwaControls className={card} />
 
           <section className={card}>
             <h2 className="font-heading text-[22px] font-medium">
