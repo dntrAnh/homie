@@ -22,7 +22,7 @@ import { cn } from "@/lib/utils"
 
 const DAYS = 14
 
-// dev-note: dates use the browser's zone; switch to PROFILE.timezone once
+// dev-note: days and new reminders use the browser's zone; switch to PROFILE.timezone once
 // /api/me/profile is wired so Alexa and the dashboard always agree.
 function dayKey(date: Date) {
   return date.toLocaleDateString("en-CA") // YYYY-MM-DD
@@ -75,7 +75,8 @@ export default function CalendarPage() {
     e.todos.map((todo) => ({ todo, event: e })),
   )
 
-  const notConnected = google.data && !google.data.connected
+  // Reminders stay off unless the server confirms a connection.
+  const connected = google.data?.connected === true
 
   return (
     <>
@@ -86,7 +87,7 @@ export default function CalendarPage() {
         action={
           <ReminderDialog
             trigger={
-              <Button size="lg" disabled={notConnected}>
+              <Button size="lg" disabled={!connected}>
                 <CalendarPlus aria-hidden /> Create reminder
               </Button>
             }
@@ -98,7 +99,7 @@ export default function CalendarPage() {
               <button
                 type="button"
                 aria-label="Create reminder"
-                disabled={notConnected}
+                disabled={!connected}
                 className={mobileActionClass}
               >
                 <Plus aria-hidden />
@@ -109,7 +110,7 @@ export default function CalendarPage() {
       />
 
       <div className="flex flex-col gap-4 p-4 md:gap-5 md:px-11 md:pt-6 md:pb-9">
-        {google.data?.connected && (
+        {connected && (
           <Link
             href="/settings"
             className="bg-blue-soft flex min-h-12 items-center gap-3 rounded-[10px] px-4 text-[13px] font-medium text-[#41609a] md:hidden"
@@ -170,7 +171,12 @@ export default function CalendarPage() {
           <div className="min-w-0 space-y-5">
             {google.isPending || events.isPending ? (
               <LoadingRows count={4} />
-            ) : notConnected ? (
+            ) : google.isError ? (
+              <ErrorState
+                error={google.error}
+                onRetry={() => google.refetch()}
+              />
+            ) : !connected ? (
               <EmptyState icon={CalendarDays} title="Connect Google Calendar">
                 <p>
                   Homie reads your upcoming events live and adds reminders you
@@ -226,7 +232,7 @@ export default function CalendarPage() {
           </div>
 
           <aside className="hidden flex-col gap-4 pt-7 md:flex">
-            {google.data?.connected && (
+            {connected && (
               <section className="bg-card rounded-xl border p-5">
                 <div className="flex items-center gap-3">
                   <span className="bg-blue-soft grid size-10 place-items-center rounded-[9px] text-[#41609a]">
