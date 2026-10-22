@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from app import main
 from app.config import Settings
 from app.middleware.auth import RateLimiter
-from app.models.simulator import ChatReply, ChatRequest, ToolCall
+from app.models.simulator import ChatReply, ChatRequest, RecallToolCall
 from app.routes import simulator as simulator_route
 from app.services import memory_service, simulator_service
 from app.services.simulator_service import (
@@ -140,10 +140,18 @@ def test_chat_reply_matches_client_contract() -> None:
     reply = ChatReply(
         reply="I found one memory.",
         tool_calls=[
-            ToolCall(
+            RecallToolCall(
                 name="recall",
                 arguments={"query": "keys"},
-                result=[{"id": "memory-1", "content": "Keys are in the drawer"}],
+                result=[
+                    {
+                        "id": "memory-1",
+                        "content": "Keys are in the drawer",
+                        "kind": "item_location",
+                        "tags": [],
+                        "created_at": "2026-10-22T12:00:00+00:00",
+                    }
+                ],
             )
         ],
     )
@@ -154,7 +162,15 @@ def test_chat_reply_matches_client_contract() -> None:
             {
                 "name": "recall",
                 "arguments": {"query": "keys"},
-                "result": [{"id": "memory-1", "content": "Keys are in the drawer"}],
+                "result": [
+                    {
+                        "id": "memory-1",
+                        "content": "Keys are in the drawer",
+                        "kind": "item_location",
+                        "tags": [],
+                        "created_at": "2026-10-22T12:00:00+00:00",
+                    }
+                ],
             }
         ],
     }
@@ -163,15 +179,35 @@ def test_chat_reply_matches_client_contract() -> None:
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
-        (ToolCall, {"name": "recall", "arguments": {}, "result": [], "extra": True}),
+        (RecallToolCall, {"name": "recall", "arguments": {}, "result": [], "extra": True}),
         (ChatReply, {"reply": "Done", "tool_calls": [], "extra": True}),
     ],
 )
 def test_response_models_reject_extra_fields(
-    model: type[ToolCall] | type[ChatReply], payload: dict[str, Any]
+    model: type[RecallToolCall] | type[ChatReply], payload: dict[str, Any]
 ) -> None:
     with pytest.raises(ValidationError):
         model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "tool_call",
+    [
+        {"name": "remember", "arguments": {}, "result": []},
+        {
+            "name": "recall",
+            "arguments": {},
+            "result": {"status": "success", "memory_id": "memory-1"},
+        },
+        {"name": "recall", "arguments": {}},
+        {"name": "unknown", "arguments": {}, "result": {"error": "No."}},
+    ],
+)
+def test_chat_reply_rejects_results_that_do_not_match_the_tool(
+    tool_call: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        ChatReply.model_validate({"reply": "Done", "tool_calls": [tool_call]})
 
 
 def test_bedrock_model_id_has_approved_default_and_env_override(
@@ -835,7 +871,7 @@ def test_run_chat_executes_multiple_tool_rounds_and_preserves_results(
 
     assert reply.reply == "All set."
     assert [call.name for call in reply.tool_calls] == ["remember", "recall", "forget"]
-    assert reply.tool_calls[1].result == [memory]
+    assert reply.model_dump()["tool_calls"][1]["result"] == [memory]
     assert mcp.calls == [
         ("remember", {"content": "Keys"}),
         ("recall", {"query": "keys"}),
@@ -844,6 +880,31 @@ def test_run_chat_executes_multiple_tool_rounds_and_preserves_results(
     first_results = conversations[1][-1]["content"]
     assert first_results[1]["toolResult"]["content"] == [{"json": {"memories": [memory]}}]
     assert first_results[1]["toolResult"]["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    ("turn", "payload"),
+    [
+        (
+            tool_turn({"toolUseId": "call-1", "name": "remember", "input": {"content": "Keys"}}),
+            {"memories": []},
+        ),
+        (
+            tool_turn({"toolUseId": "call-1", "name": "recall", "input": {"query": "keys"}}),
+            {"memories": [{"id": "memory-1", "content": "Missing required fields"}]},
+        ),
+    ],
+)
+def test_run_chat_rejects_mcp_results_that_do_not_match_the_tool_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    turn: BedrockTurn,
+    payload: dict[str, Any],
+) -> None:
+    install_scripted_boundaries(monkeypatch, [turn], [successful_tool_result(payload)])
+    request = ChatRequest(messages=[message("user")])
+
+    with pytest.raises(UpstreamUnavailableError):
+        asyncio.run(run_chat(request.messages, "exact-token"))
 
 
 @pytest.mark.parametrize(
@@ -1007,7 +1068,9 @@ def test_run_chat_returns_tool_errors_to_bedrock_for_explanation(
 
     reply = asyncio.run(run_chat(request.messages, "exact-token"))
 
-    assert reply.tool_calls[0].result == {"error": "I couldn't find that memory."}
+    assert reply.model_dump()["tool_calls"][0]["result"] == {
+        "error": "I couldn't find that memory."
+    }
     tool_result = conversations[1][-1]["content"][0]["toolResult"]
     assert tool_result["status"] == "error"
     assert tool_result["content"] == [{"json": {"error": "I couldn't find that memory."}}]
