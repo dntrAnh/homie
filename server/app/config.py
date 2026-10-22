@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     aws_region: str = "us-east-1"
+    bedrock_model_id: str = "us.anthropic.claude-sonnet-5-5"
     dynamodb_table: str = "homie-dev"
     dynamodb_endpoint_url: str | None = None
     cors_origins: list[str] = ["http://localhost:3000"]
