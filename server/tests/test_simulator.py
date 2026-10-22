@@ -1,6 +1,8 @@
 import asyncio
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from copy import deepcopy
 from threading import get_ident
 from time import time
 from typing import Any
@@ -12,7 +14,7 @@ from botocore.exceptions import ClientError, ReadTimeoutError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from mcp_types import Tool
+from mcp_types import CallToolResult, TextContent, Tool
 from pydantic import ValidationError
 
 from app import main
@@ -23,6 +25,9 @@ from app.routes import simulator as simulator_route
 from app.services import memory_service, simulator_service
 from app.services.simulator_service import (
     BEDROCK_MAX_OUTPUT_TOKENS,
+    MAX_BEDROCK_ROUNDS,
+    MAX_TOOL_CALLS,
+    PARTIAL_REPLY,
     SYSTEM_PROMPT,
     BedrockTurn,
     InvalidModelOutputError,
@@ -34,6 +39,7 @@ from app.services.simulator_service import (
     bedrock_messages,
     call_bedrock,
     connect_mcp,
+    run_chat,
 )
 
 TEST_CLIENT_ID = "test-client"
@@ -719,3 +725,479 @@ def test_mcp_boundary_uses_forwarded_token_and_real_in_process_endpoint(
     assert captured["token"] == token
     assert set(names) == {"remember", "recall", "forget"}
     assert recalled == {"memories": []}
+
+
+# Mock full bedrock and test full chat orchestration
+
+
+class ScriptedMcpClient:
+    def __init__(self, results: list[CallToolResult | Exception]) -> None:
+        self.bedrock_tools: list[dict[str, Any]] = []
+        self.results = results
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        self.calls.append((name, arguments))
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def successful_tool_result(payload: dict[str, Any]) -> CallToolResult:
+    return CallToolResult(content=[], structuredContent=payload)
+
+
+def tool_turn(*tool_uses: dict[str, Any]) -> BedrockTurn:
+    return BedrockTurn(
+        message={
+            "role": "assistant",
+            "content": [{"toolUse": tool_use} for tool_use in tool_uses],
+        },
+        stop_reason="tool_use",
+    )
+
+
+def text_turn(text: str = "Done.") -> BedrockTurn:
+    return BedrockTurn(
+        message={"role": "assistant", "content": [{"text": text}]},
+        stop_reason="end_turn",
+    )
+
+
+def install_scripted_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    turns: list[BedrockTurn | Exception],
+    results: list[CallToolResult | Exception],
+) -> tuple[ScriptedMcpClient, list[list[dict[str, Any]]]]:
+    mcp = ScriptedMcpClient(results)
+    conversations: list[list[dict[str, Any]]] = []
+
+    @asynccontextmanager
+    async def fake_connect(access_token: str) -> AsyncIterator[ScriptedMcpClient]:
+        assert access_token == "exact-token"
+        yield mcp
+
+    async def fake_call_bedrock(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> BedrockTurn:
+        conversations.append(deepcopy(messages))
+        turn = turns.pop(0)
+        if isinstance(turn, Exception):
+            raise turn
+        return turn
+
+    monkeypatch.setattr(simulator_service, "connect_mcp", fake_connect)
+    monkeypatch.setattr(simulator_service, "call_bedrock", fake_call_bedrock)
+    return mcp, conversations
+
+
+def test_run_chat_returns_text_without_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp, conversations = install_scripted_boundaries(monkeypatch, [text_turn(" Ready. ")], [])
+    request = ChatRequest(messages=[message("user", "Hello")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply == ChatReply(reply="Ready.", tool_calls=[])
+    assert mcp.calls == []
+    assert conversations == [bedrock_messages(request.messages)]
+
+
+def test_run_chat_executes_multiple_tool_rounds_and_preserves_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = {
+        "id": "memory-1",
+        "content": "Keys are in the drawer",
+        "kind": "item_location",
+        "tags": [],
+        "created_at": "2026-10-22T12:00:00+00:00",
+    }
+    turns = [
+        tool_turn(
+            {"toolUseId": "call-1", "name": "remember", "input": {"content": "Keys"}},
+            {"toolUseId": "call-2", "name": "recall", "input": {"query": "keys"}},
+        ),
+        tool_turn({"toolUseId": "call-3", "name": "forget", "input": {"memory_id": "memory-1"}}),
+        text_turn("All set."),
+    ]
+    results = [
+        successful_tool_result({"status": "success", "memory_id": "memory-1"}),
+        successful_tool_result({"memories": [memory]}),
+        successful_tool_result({"status": "success", "memory_id": "memory-1"}),
+    ]
+    mcp, conversations = install_scripted_boundaries(monkeypatch, turns, results)
+    request = ChatRequest(messages=[message("user", "Manage my keys")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.reply == "All set."
+    assert [call.name for call in reply.tool_calls] == ["remember", "recall", "forget"]
+    assert reply.tool_calls[1].result == [memory]
+    assert mcp.calls == [
+        ("remember", {"content": "Keys"}),
+        ("recall", {"query": "keys"}),
+        ("forget", {"memory_id": "memory-1"}),
+    ]
+    first_results = conversations[1][-1]["content"]
+    assert first_results[1]["toolResult"]["content"] == [{"json": {"memories": [memory]}}]
+    assert first_results[1]["toolResult"]["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "uses",
+    [
+        [{"toolUseId": "", "name": "recall", "input": {"query": "keys"}}],
+        [
+            {"toolUseId": "same", "name": "recall", "input": {"query": "keys"}},
+            {"toolUseId": "same", "name": "recall", "input": {"query": "keys"}},
+        ],
+        [{"toolUseId": 123, "name": "recall", "input": {"query": "keys"}}],
+        [{"toolUseId": "call-1", "name": "unknown", "input": {}}],
+        [{"toolUseId": "call-1", "name": "recall", "input": "keys"}],
+        [{"toolUseId": "call-1", "name": "recall", "input": {"query": "x" * 4097}}],
+    ],
+)
+def test_run_chat_rejects_invalid_tool_batch_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    uses: list[dict[str, Any]],
+) -> None:
+    mcp, _ = install_scripted_boundaries(monkeypatch, [tool_turn(*uses)], [])
+    request = ChatRequest(messages=[message("user")])
+
+    with pytest.raises(InvalidModelOutputError):
+        asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert mcp.calls == []
+
+
+def test_run_chat_rejects_reused_tool_id_across_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = [
+        tool_turn({"toolUseId": "same", "name": "recall", "input": {"query": "keys"}}),
+        tool_turn({"toolUseId": "same", "name": "recall", "input": {"query": "keys"}}),
+    ]
+    results = [successful_tool_result({"memories": []})]
+    mcp, _ = install_scripted_boundaries(monkeypatch, turns, results)
+    request = ChatRequest(messages=[message("user")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.reply == PARTIAL_REPLY
+    assert len(reply.tool_calls) == 1
+    assert len(mcp.calls) == 1
+
+
+def test_run_chat_rejects_excess_tool_calls_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uses = [
+        {"toolUseId": f"call-{index}", "name": "recall", "input": {"query": "keys"}}
+        for index in range(MAX_TOOL_CALLS + 1)
+    ]
+    mcp, _ = install_scripted_boundaries(monkeypatch, [tool_turn(*uses)], [])
+    request = ChatRequest(messages=[message("user")])
+
+    with pytest.raises(InvalidModelOutputError):
+        asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert mcp.calls == []
+
+
+def test_run_chat_enforces_cumulative_tool_budget_before_next_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_batch = [
+        {"toolUseId": f"call-{index}", "name": "recall", "input": {"query": str(index)}}
+        for index in range(MAX_TOOL_CALLS)
+    ]
+    turns = [
+        tool_turn(*first_batch),
+        tool_turn({"toolUseId": "excess", "name": "recall", "input": {"query": "extra"}}),
+    ]
+    results = [successful_tool_result({"memories": []}) for _ in first_batch]
+    mcp, _ = install_scripted_boundaries(monkeypatch, turns, results)
+    request = ChatRequest(messages=[message("user")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.reply == PARTIAL_REPLY
+    assert len(reply.tool_calls) == MAX_TOOL_CALLS
+    assert len(mcp.calls) == MAX_TOOL_CALLS
+
+
+def test_run_chat_returns_partial_reply_when_round_budget_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = [
+        tool_turn({"toolUseId": f"call-{index}", "name": "recall", "input": {"query": str(index)}})
+        for index in range(MAX_BEDROCK_ROUNDS)
+    ]
+    results = [successful_tool_result({"memories": []}) for _ in turns]
+    mcp, _ = install_scripted_boundaries(monkeypatch, turns, results)
+    request = ChatRequest(messages=[message("user")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.reply == PARTIAL_REPLY
+    assert len(reply.tool_calls) == MAX_BEDROCK_ROUNDS
+    assert len(mcp.calls) == MAX_BEDROCK_ROUNDS
+
+
+def test_run_chat_returns_partial_reply_after_confirmed_call_then_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = [
+        tool_turn({"toolUseId": "call-1", "name": "remember", "input": {"content": "Keys"}}),
+        UpstreamUnavailableError("private Bedrock error"),
+    ]
+    results = [successful_tool_result({"status": "success", "memory_id": "memory-1"})]
+    _, _ = install_scripted_boundaries(monkeypatch, turns, results)
+    request = ChatRequest(messages=[message("user")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.reply == PARTIAL_REPLY
+    assert [call.name for call in reply.tool_calls] == ["remember"]
+    assert "private" not in reply.model_dump_json()
+
+
+def test_run_chat_returns_partial_reply_when_later_mcp_call_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = [
+        tool_turn(
+            {"toolUseId": "call-1", "name": "remember", "input": {"content": "Keys"}},
+            {"toolUseId": "call-2", "name": "recall", "input": {"query": "keys"}},
+        )
+    ]
+    results = [
+        successful_tool_result({"status": "success", "memory_id": "memory-1"}),
+        UpstreamUnavailableError("private MCP error"),
+    ]
+    mcp, _ = install_scripted_boundaries(monkeypatch, turns, results)
+    request = ChatRequest(messages=[message("user")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.reply == PARTIAL_REPLY
+    assert [call.name for call in reply.tool_calls] == ["remember"]
+    assert len(mcp.calls) == 2
+    assert "private" not in reply.model_dump_json()
+
+
+def test_run_chat_returns_tool_errors_to_bedrock_for_explanation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = [
+        tool_turn({"toolUseId": "call-1", "name": "forget", "input": {"memory_id": "missing"}}),
+        text_turn("I couldn't find that memory."),
+    ]
+    results = [
+        CallToolResult(
+            content=[TextContent(type="text", text="I couldn't find that memory.")],
+            isError=True,
+        )
+    ]
+    _, conversations = install_scripted_boundaries(monkeypatch, turns, results)
+    request = ChatRequest(messages=[message("user")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.tool_calls[0].result == {"error": "I couldn't find that memory."}
+    tool_result = conversations[1][-1]["content"][0]["toolResult"]
+    assert tool_result["status"] == "error"
+    assert tool_result["content"] == [{"json": {"error": "I couldn't find that memory."}}]
+
+
+def test_run_chat_enforces_overall_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp = ScriptedMcpClient([])
+
+    @asynccontextmanager
+    async def fake_connect(access_token: str) -> AsyncIterator[ScriptedMcpClient]:
+        yield mcp
+
+    async def slow_bedrock(*args: Any, **kwargs: Any) -> BedrockTurn:
+        await asyncio.sleep(0.05)
+        return text_turn()
+
+    monkeypatch.setattr(simulator_service, "connect_mcp", fake_connect)
+    monkeypatch.setattr(simulator_service, "call_bedrock", slow_bedrock)
+    monkeypatch.setattr(simulator_service, "REQUEST_TIMEOUT_SECONDS", 0.001)
+    request = ChatRequest(messages=[message("user")])
+
+    with pytest.raises(SimulatorTimeoutError):
+        asyncio.run(run_chat(request.messages, "exact-token"))
+
+
+def test_run_chat_returns_partial_reply_on_timeout_after_confirmed_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp = ScriptedMcpClient(
+        [successful_tool_result({"status": "success", "memory_id": "memory-1"})]
+    )
+    calls = 0
+
+    @asynccontextmanager
+    async def fake_connect(access_token: str) -> AsyncIterator[ScriptedMcpClient]:
+        yield mcp
+
+    async def timed_bedrock(*args: Any, **kwargs: Any) -> BedrockTurn:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return tool_turn(
+                {"toolUseId": "call-1", "name": "remember", "input": {"content": "Keys"}}
+            )
+        await asyncio.sleep(0.05)
+        return text_turn()
+
+    monkeypatch.setattr(simulator_service, "connect_mcp", fake_connect)
+    monkeypatch.setattr(simulator_service, "call_bedrock", timed_bedrock)
+    monkeypatch.setattr(simulator_service, "REQUEST_TIMEOUT_SECONDS", 0.01)
+    request = ChatRequest(messages=[message("user")])
+
+    reply = asyncio.run(run_chat(request.messages, "exact-token"))
+
+    assert reply.reply == PARTIAL_REPLY
+    assert [call.name for call in reply.tool_calls] == ["remember"]
+
+
+def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
+    simulator_client: TestClient,
+    ddb_table: Any,
+    fake_jwks_endpoint: str,
+    test_signing_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WorkflowBedrock:
+        def __init__(self) -> None:
+            self.next_id = 1
+            self.pending_tools: dict[str, str] = {}
+            self.received_results: list[tuple[str, dict[str, Any]]] = []
+
+        def converse(self, **kwargs: Any) -> dict[str, Any]:
+            last_message = kwargs["messages"][-1]
+            last_block = last_message["content"][0]
+            if "toolResult" in last_block:
+                tool_result = last_block["toolResult"]
+                payload = tool_result["content"][0]["json"]
+                name = self.pending_tools.pop(tool_result["toolUseId"])
+                self.received_results.append((name, payload))
+                return {
+                    "stopReason": "end_turn",
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": f"Completed {name}."}],
+                        }
+                    },
+                }
+
+            prompt = last_block["text"]
+            if prompt.startswith("Remember"):
+                name = "remember"
+                arguments = {
+                    "content": "Keys are in the kitchen drawer",
+                    "kind": "item_location",
+                }
+            elif prompt.startswith("Recall"):
+                name = "recall"
+                arguments = {"query": "keys"}
+            elif prompt.startswith("Forget "):
+                name = "forget"
+                arguments = {"memory_id": prompt.removeprefix("Forget ")}
+            else:
+                raise AssertionError(f"Unexpected prompt: {prompt}")
+
+            tool_use_id = f"workflow-{self.next_id}"
+            self.next_id += 1
+            self.pending_tools[tool_use_id] = name
+            return {
+                "stopReason": "tool_use",
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": tool_use_id,
+                                    "name": name,
+                                    "input": arguments,
+                                }
+                            }
+                        ],
+                    }
+                },
+            }
+
+    bedrock = WorkflowBedrock()
+    monkeypatch.setattr(memory_service, "get_table", lambda: ddb_table)
+    monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
+    monkeypatch.setattr(simulator_service, "get_bedrock_client", lambda: bedrock)
+
+    def in_process_mcp_client(access_token: str) -> httpx2.AsyncClient:
+        return httpx2.AsyncClient(
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=httpx2.Timeout(8),
+            transport=httpx2.ASGITransport(app=main.app),
+        )
+
+    monkeypatch.setattr(simulator_service, "_create_mcp_http_client", in_process_mcp_client)
+    alice_headers = {
+        "Authorization": f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key)}"
+    }
+    bob_headers = {
+        "Authorization": (
+            f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key, user_sub='bob')}"
+        )
+    }
+
+    remembered = simulator_client.post(
+        "/api/simulator/chat",
+        headers=alice_headers,
+        json={"messages": [message("user", "Remember my keys")]},
+    )
+    assert remembered.status_code == 200, remembered.text
+    memory_id = remembered.json()["tool_calls"][0]["result"]["memory_id"]
+    assert ddb_table.get_item(Key={"pk": "USER#alice", "sk": f"MEM#{memory_id}"}).get("Item")
+    assert not ddb_table.get_item(Key={"pk": "USER#bob", "sk": f"MEM#{memory_id}"}).get("Item")
+
+    bob_recalled = simulator_client.post(
+        "/api/simulator/chat",
+        headers=bob_headers,
+        json={"messages": [message("user", "Recall keys for Bob")]},
+    )
+    assert bob_recalled.status_code == 200, bob_recalled.text
+    assert bob_recalled.json()["tool_calls"][0]["result"] == []
+
+    alice_recalled = simulator_client.post(
+        "/api/simulator/chat",
+        headers=alice_headers,
+        json={"messages": [message("user", "Recall keys for Alice")]},
+    )
+    assert alice_recalled.status_code == 200, alice_recalled.text
+    recalled_memories = alice_recalled.json()["tool_calls"][0]["result"]
+    assert [item["id"] for item in recalled_memories] == [memory_id]
+    assert recalled_memories[0]["content"] == "Keys are in the kitchen drawer"
+
+    forgotten = simulator_client.post(
+        "/api/simulator/chat",
+        headers=alice_headers,
+        json={"messages": [message("user", f"Forget {memory_id}")]},
+    )
+    assert forgotten.status_code == 200, forgotten.text
+    assert forgotten.json()["tool_calls"][0]["result"] == {
+        "status": "success",
+        "memory_id": memory_id,
+    }
+    assert not ddb_table.get_item(Key={"pk": "USER#alice", "sk": f"MEM#{memory_id}"}).get("Item")
+
+    recall_results = [payload for name, payload in bedrock.received_results if name == "recall"]
+    assert recall_results[0] == {"memories": []}
+    assert recall_results[1]["memories"][0]["id"] == memory_id
