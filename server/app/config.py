@@ -1,5 +1,5 @@
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -10,6 +10,9 @@ class Settings(BaseSettings):
 
     aws_region: str = "us-east-1"
     bedrock_model_id: str = "us.anthropic.claude-sonnet-5-5"
+    simulator_provider: Literal["ollama", "bedrock"] = "ollama"
+    simulator_ollama_model: str = "llama3.1:8b"
+    ollama_host: str = "http://localhost:11434"
     dynamodb_table: str = "homie-dev"
     dynamodb_endpoint_url: str | None = None
     cors_origins: list[str] = ["http://localhost:3000"]
@@ -23,6 +26,21 @@ class Settings(BaseSettings):
     google_maps_api_key: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
+
+    @field_validator("simulator_provider", mode="before")
+    @classmethod
+    def default_empty_simulator_provider(cls, value: Any) -> Any:
+        return value or "ollama"
+
+    @field_validator("simulator_ollama_model", mode="before")
+    @classmethod
+    def default_empty_ollama_model(cls, value: Any) -> Any:
+        return value or "llama3.1:8b"
+
+    @field_validator("ollama_host", mode="before")
+    @classmethod
+    def default_empty_ollama_host(cls, value: Any) -> Any:
+        return value or "http://localhost:11434"
 
     @field_validator("cognito_client_ids", mode="before")
     @classmethod

@@ -75,26 +75,31 @@ curl -X POST http://127.0.0.1:8000/api/simulator/chat \
   -d '{"messages":[{"role":"user","content":"Remember my keys are in the drawer"}]}'
 ```
 
-The endpoint calls `BEDROCK_MODEL_ID` through the standard boto3 credential
+The endpoint selects its model with `SIMULATOR_PROVIDER` (`ollama` by default,
+or `bedrock`). Ollama calls `OLLAMA_HOST` (default
+`http://localhost:11434`) with `SIMULATOR_OLLAMA_MODEL` (default
+`llama3.1:8b`). For the Docker filming stack, set `OLLAMA_HOST` to
+`http://host.docker.internal:11434` and expose the host Ollama daemon on
+`0.0.0.0:11434`; do not expose that endpoint on an untrusted network. The
+Bedrock provider uses `BEDROCK_MODEL_ID` through the standard boto3 credential
 chain (for example, an ECS task role in AWS or a configured developer profile
-locally). It forwards the caller's exact Cognito bearer token to this server's
+locally). Both providers forward the caller's exact Cognito bearer token to this server's
 Streamable HTTP `/mcp` endpoint, so MCP authentication—not request-body data—
 determines memory ownership. The simulator never calls the memory service
 directly.
 
-Each request is limited to three Bedrock Converse rounds, four total MCP tool
+Each request is limited to three model rounds, four total MCP tool
 calls, 4 KiB of JSON arguments per tool call, eight seconds per MCP operation,
-and 60 seconds overall. Converse output is capped at 512 tokens. Requests are
+and 60 seconds overall. Model output is capped at 512 tokens. Requests are
 also limited per authenticated user to 10 per rolling minute and 200 per
 rolling 24 hours, per server process. A `429` response includes a `Retry-After`
 value calculated from the oldest request still occupying that window.
 
-For local manual use, configure Cognito, `PUBLIC_BASE_URL`, AWS credentials,
-Bedrock model access, and `BEDROCK_MODEL_ID` in `server/.env`, then run
-`uv run fastapi dev app/main.py`. Automated simulator tests need no live AWS
-credentials, Bedrock access, or external MCP process: they use a scripted
-Bedrock client, the in-process `/mcp` ASGI transport, and Moto DynamoDB. Run
-them with `uv run pytest tests/test_simulator.py`.
+For local manual use, configure Cognito, `PUBLIC_BASE_URL`, and the desired
+provider settings in `server/.env`, then run `uv run fastapi dev app/main.py`.
+Automated simulator tests need no live model or external MCP process: they use
+scripted provider responses, the in-process `/mcp` ASGI transport, and Moto
+DynamoDB. Run them with `uv run pytest tests/test_simulator.py`.
 
 ## Memory API
 

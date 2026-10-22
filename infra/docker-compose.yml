@@ -20,6 +20,7 @@ services:
       DYNAMODB_ENDPOINT_URL: http://dynamodb:8000
       AWS_ACCESS_KEY_ID: local
       AWS_SECRET_ACCESS_KEY: local
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
     ports: ["8000:8000"]
     depends_on: [dynamodb]
 
