@@ -34,18 +34,6 @@ export default function SettingsPage() {
             <p className="text-muted-foreground text-sm">{user?.email ?? ""}</p>
           </div>
 
-          <div className="space-y-2 rounded-md border p-4">
-            <h2 className="font-medium">Install Homie</h2>
-            <p className="text-muted-foreground text-sm">
-              iPhone or iPad: open this page in Safari, tap Share, then choose
-              Add to Home Screen.
-            </p>
-            <p className="text-muted-foreground text-sm">
-              Android: open this page in Chrome, tap the menu, then choose
-              Install app or Add to Home screen.
-            </p>
-          </div>
-
           <Button
             variant="destructive"
             size="lg"

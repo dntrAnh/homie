@@ -19,6 +19,12 @@ const dmSans = DM_Sans({
 export const metadata: Metadata = {
   title: "homie",
   description: "See and control what your Alexa remembers.",
+  applicationName: "homie",
+  appleWebApp: {
+    capable: true,
+    title: "homie",
+    statusBarStyle: "default",
+  },
 }
 
 export const viewport: Viewport = {
