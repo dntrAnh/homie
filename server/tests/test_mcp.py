@@ -4,12 +4,13 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta
 from time import time
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import jwt
 import pytest
-from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from httpx import Response
@@ -120,6 +121,19 @@ def tool_error(response: Response) -> str:
     tool_result = result(response)
     assert tool_result["isError"] is True, tool_result
     return " ".join(part.get("text", "") for part in tool_result.get("content", []))
+
+
+def test_remember_is_blocked_while_account_is_deleting(mcp_client: tuple[McpClient, Any]) -> None:
+    mcp, table = mcp_client
+    table.put_item(Item={"pk": "USER#alice", "sk": "DELETING"})
+
+    assert tool_error(mcp.call("remember", {"content": "Do not save"})) == (
+        "Your Homie account is being deleted, so I can't save that."
+    )
+    assert MemoryService(table=table).list_memories("alice") == []
+    assert successful_content(
+        mcp.call("remember", {"content": "Bob's memory"}, token=mcp.token("bob"))
+    )
 
 
 def test_initialization_tool_schemas_and_endpoint_shape(mcp_client: tuple[McpClient, Any]) -> None:
@@ -432,6 +446,40 @@ def test_forget_invalid_ids_and_storage_failure_are_safe(
     response = mcp.call("recall", {"query": "anything"})
     assert tool_error(response)
     assert "private-storage.example" not in response.text
+
+
+@pytest.mark.parametrize("transport", [False, True])
+@pytest.mark.parametrize(
+    ("tool", "arguments", "operation"),
+    [
+        ("remember", {"content": "Memory"}, "transact_write_items"),
+        ("recall", {"query": ""}, "query"),
+        ("forget", {"memory_id": str(uuid4())}, "delete_item"),
+    ],
+)
+def test_service_storage_errors_are_sanitized_mcp_tool_errors(
+    mcp_client: tuple[McpClient, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict[str, Any],
+    operation: str,
+    transport: bool,
+) -> None:
+    mcp, table = mcp_client
+    result(mcp.initialize())
+    error = (
+        EndpointConnectionError(endpoint_url="secret-internal-storage")
+        if transport
+        else ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "secret"}},
+            operation,
+        )
+    )
+    target = table.meta.client if operation == "transact_write_items" else table
+    monkeypatch.setattr(target, operation, Mock(side_effect=error))
+    response = mcp.call(tool, arguments)
+    assert tool_error(response) == "Memory storage is unavailable. Please try again shortly."
+    assert "secret" not in response.text
 
 
 def test_expected_tool_errors_keep_exact_safe_text(mcp_client: tuple[McpClient, Any]) -> None:
