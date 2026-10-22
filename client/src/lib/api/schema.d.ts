@@ -114,6 +114,32 @@ export interface paths {
 export type webhooks = Record<string, never>
 export interface components {
   schemas: {
+    /** ChangeResult */
+    ChangeResult: {
+      /**
+       * Status
+       * @constant
+       */
+      status: "success"
+      /** Memory Id */
+      memory_id: string
+    }
+    /** ChangeToolCall */
+    ChangeToolCall: {
+      /**
+       * @description discriminator enum property added by openapi-typescript
+       * @enum {string}
+       */
+      name: "forget" | "remember"
+      /** Arguments */
+      arguments: {
+        [key: string]: unknown
+      }
+      /** Result */
+      result:
+        | components["schemas"]["ChangeResult"]
+        | components["schemas"]["ToolErrorResult"]
+    }
     /** ChatMessage */
     ChatMessage: {
       /**
@@ -129,7 +155,10 @@ export interface components {
       /** Reply */
       reply: string
       /** Tool Calls */
-      tool_calls: components["schemas"]["ToolCall"][]
+      tool_calls: (
+        | components["schemas"]["ChangeToolCall"]
+        | components["schemas"]["RecallToolCall"]
+      )[]
     }
     /** ChatRequest */
     ChatRequest: {
@@ -243,16 +272,42 @@ export interface components {
       /** Travel Mode */
       travel_mode?: ("DRIVE" | "WALK" | "BICYCLE" | "TRANSIT") | null
     }
-    /** ToolCall */
-    ToolCall: {
-      /** Name */
-      name: string
+    /** RecallToolCall */
+    RecallToolCall: {
+      /**
+       * @description discriminator enum property added by openapi-typescript
+       * @enum {string}
+       */
+      name: "recall"
       /** Arguments */
       arguments: {
         [key: string]: unknown
       }
       /** Result */
-      result?: unknown
+      result:
+        | components["schemas"]["RecalledMemory"][]
+        | components["schemas"]["ToolErrorResult"]
+    }
+    /** RecalledMemory */
+    RecalledMemory: {
+      /** Id */
+      id: string
+      /** Content */
+      content: string
+      /**
+       * Kind
+       * @enum {string}
+       */
+      kind: "item_location" | "fact" | "preference" | "todo"
+      /** Tags */
+      tags: string[]
+      /** Created At */
+      created_at: string
+    }
+    /** ToolErrorResult */
+    ToolErrorResult: {
+      /** Error */
+      error: string
     }
     /** ValidationError */
     ValidationError: {

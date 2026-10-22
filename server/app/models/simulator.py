@@ -2,11 +2,12 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from app.models.memory import ChangeResult, RecalledMemory
+
 MessageContent = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)
 ]
 ReplyContent = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-ToolName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class ChatMessage(BaseModel):
@@ -37,12 +38,29 @@ class ChatRequest(BaseModel):
         return self
 
 
-class ToolCall(BaseModel):
+class ToolErrorResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: ToolName
+    error: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class ChangeToolCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Literal["remember", "forget"]
     arguments: dict[str, Any]
-    result: Any = None
+    result: ChangeResult | ToolErrorResult
+
+
+class RecallToolCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Literal["recall"]
+    arguments: dict[str, Any]
+    result: list[RecalledMemory] | ToolErrorResult
+
+
+ToolCall = Annotated[ChangeToolCall | RecallToolCall, Field(discriminator="name")]
 
 
 class ChatReply(BaseModel):

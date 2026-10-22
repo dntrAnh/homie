@@ -19,9 +19,18 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp_types import CallToolResult, Tool
+from pydantic import ValidationError
 
 from app.config import settings
-from app.models.simulator import ChatMessage, ChatReply, ToolCall
+from app.models.memory import ChangeResult, RecallResult
+from app.models.simulator import (
+    ChangeToolCall,
+    ChatMessage,
+    ChatReply,
+    RecallToolCall,
+    ToolCall,
+    ToolErrorResult,
+)
 
 BEDROCK_MAX_OUTPUT_TOKENS = 512
 MCP_TIMEOUT_SECONDS = 8.0
@@ -327,13 +336,29 @@ def _mcp_result_payload(result: CallToolResult) -> dict[str, Any]:
     return result.structured_content
 
 
-def _ui_result(name: str, payload: dict[str, Any], *, is_error: bool) -> Any:
-    if name != "recall" or is_error:
-        return payload
-    memories = payload.get("memories")
-    if not isinstance(memories, list):
-        raise UpstreamUnavailableError
-    return memories
+def _tool_call(
+    name: str,
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    is_error: bool,
+) -> ToolCall:
+    try:
+        if is_error:
+            result = ToolErrorResult.model_validate(payload)
+            if name == "recall":
+                return RecallToolCall(name=name, arguments=arguments, result=result)
+            if name in {"remember", "forget"}:
+                return ChangeToolCall(name=name, arguments=arguments, result=result)
+        elif name == "recall":
+            result = RecallResult.model_validate(payload)
+            return RecallToolCall(name=name, arguments=arguments, result=result.memories)
+        elif name in {"remember", "forget"}:
+            result = ChangeResult.model_validate(payload)
+            return ChangeToolCall(name=name, arguments=arguments, result=result)
+    except ValidationError as exc:
+        raise UpstreamUnavailableError from exc
+    raise UpstreamUnavailableError
 
 
 async def _orchestrate_chat(
@@ -365,10 +390,11 @@ async def _orchestrate_chat(
                 result = await mcp.call_tool(request.name, request.arguments)
                 payload = _mcp_result_payload(result)
                 confirmed_calls.append(
-                    ToolCall(
-                        name=request.name,
-                        arguments=request.arguments,
-                        result=_ui_result(request.name, payload, is_error=result.is_error),
+                    _tool_call(
+                        request.name,
+                        request.arguments,
+                        payload,
+                        is_error=result.is_error,
                     )
                 )
                 bedrock_results.append(

@@ -68,3 +68,26 @@ class Memory(BaseModel):
     created_at: datetime
     updated_at: datetime
     timezone: str = "UTC"
+
+
+class ChangeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["success"]
+    memory_id: str
+
+
+class RecalledMemory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    content: str
+    kind: Kind
+    tags: list[str]
+    created_at: str
+
+
+class RecallResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memories: list[RecalledMemory]

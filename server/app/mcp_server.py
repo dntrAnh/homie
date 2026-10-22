@@ -1,6 +1,6 @@
 """Alexa-facing MCP tools backed by the authenticated memory service."""
 
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, get_args
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -9,37 +9,14 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import CallToolResult, InputRequiredResult
-from pydantic import BaseModel, ConfigDict, PlainValidator, ValidationError, WithJsonSchema
+from pydantic import PlainValidator, ValidationError, WithJsonSchema
 
 from app.config import settings
-from app.models.memory import Kind, MemoryCreate
+from app.models.memory import ChangeResult, Kind, MemoryCreate, RecalledMemory, RecallResult
 from app.services.memory_service import AccountDeletingError, MemoryService
 from app.services.storage import StorageError
 
 _KINDS = get_args(Kind)
-
-
-class ChangeResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    status: Literal["success"]
-    memory_id: str
-
-
-class RecalledMemory(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    content: str
-    kind: Kind
-    tags: list[str]
-    created_at: str
-
-
-class RecallResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    memories: list[RecalledMemory]
 
 
 def _user_sub(ctx: Context) -> str:
