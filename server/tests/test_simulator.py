@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -18,35 +19,56 @@ from mcp_types import CallToolResult, TextContent, Tool
 from pydantic import ValidationError
 
 from app import main
-from app.config import Settings
+from app.config import Settings, settings
 from app.middleware.auth import RateLimiter
-from app.models.simulator import ChatReply, ChatRequest, ToolCall
+from app.models.simulator import ChatMessage, ChatReply, ChatRequest, ToolCall
 from app.routes import simulator as simulator_route
 from app.services import memory_service, simulator_service
 from app.services.simulator_service import (
     BEDROCK_MAX_OUTPUT_TOKENS,
     MAX_BEDROCK_ROUNDS,
+    MAX_TOOL_ARGUMENT_BYTES,
     MAX_TOOL_CALLS,
     PARTIAL_REPLY,
     SYSTEM_PROMPT,
-    BedrockTurn,
     InvalidModelOutputError,
     McpToolClient,
+    ModelMessage,
+    ModelToolCall,
+    ModelTurn,
+    OllamaProvider,
     SimulatorServiceError,
     SimulatorTimeoutError,
+    ToolSpec,
     UpstreamUnavailableError,
     _bedrock_tools,
-    bedrock_messages,
+    _ollama_messages,
+    _ollama_model_turn,
+    _ollama_tools,
+    _tool_requests,
     call_bedrock,
     connect_mcp,
     run_chat,
 )
 
 TEST_CLIENT_ID = "test-client"
+EXPECTED_TOOLS = ("remember", "recall", "forget")
 
 
-def message(role: str, content: str = "Hello") -> dict[str, str]:
+def tool_specs() -> list[ToolSpec]:
+    return [ToolSpec(name, f"Use {name}", {"type": "object"}) for name in EXPECTED_TOOLS]
+
+
+def message(role: str, content: str = "Hello") -> ChatMessage:
+    return ChatMessage.model_validate({"role": role, "content": content})
+
+
+def raw_message(role: str, content: str = "Hello") -> dict[str, str]:
     return {"role": role, "content": content}
+
+
+def json_messages(messages: list[ChatMessage]) -> list[dict[str, str]]:
+    return [message.model_dump() for message in messages]
 
 
 def signed_token(
@@ -109,12 +131,12 @@ def test_chat_request_accepts_valid_conversations_and_trims_content() -> None:
     [
         [],
         [message("assistant")],
-        [message("system")],
+        [raw_message("system")],
         [message("user"), message("assistant")],
         [message("user"), message("user")],
-        [message("user", "")],
-        [message("user", "   ")],
-        [message("user", "x" * 2001)],
+        [raw_message("user", "")],
+        [raw_message("user", "   ")],
+        [raw_message("user", "x" * 2001)],
         [message("user") for _ in range(21)],
         [message(role, "x" * 2000) for role in ["user", "assistant"] * 3 + ["user"]],
     ],
@@ -128,7 +150,7 @@ def test_chat_request_rejects_invalid_transcripts(messages: list[dict[str, str]]
     "payload",
     [
         {"messages": [message("user")], "unexpected": True},
-        {"messages": [{**message("user"), "unexpected": True}]},
+        {"messages": [{**raw_message("user"), "unexpected": True}]},
     ],
 )
 def test_chat_request_rejects_extra_fields(payload: dict[str, Any]) -> None:
@@ -184,6 +206,18 @@ def test_bedrock_model_id_has_approved_default_and_env_override(
     assert Settings(_env_file=None).bedrock_model_id == "global.anthropic.claude-sonnet-5-5"
 
 
+def test_simulator_provider_config_uses_ollama_defaults_for_blank_values() -> None:
+    configured = Settings(
+        _env_file=None,
+        simulator_provider="",  # type: ignore[arg-type]
+        simulator_ollama_model="",
+        ollama_host="",
+    )
+    assert configured.simulator_provider == "ollama"
+    assert configured.simulator_ollama_model == "llama3.1:8b"
+    assert configured.ollama_host == "http://localhost:11434"
+
+
 def test_simulator_service_errors_have_one_typed_boundary() -> None:
     assert issubclass(InvalidModelOutputError, SimulatorServiceError)
     assert issubclass(UpstreamUnavailableError, SimulatorServiceError)
@@ -208,7 +242,7 @@ def test_chat_route_forwards_exact_authenticated_token(
     response = simulator_client.post(
         "/api/simulator/chat",
         headers={"Authorization": f"Bearer {token}"},
-        json={"messages": [message("user", "Remember this")]},
+        json={"messages": json_messages([message("user", "Remember this")])},
     )
 
     assert response.status_code == 200
@@ -255,7 +289,7 @@ def test_chat_route_requires_linked_user_tools_token(
     response = simulator_client.post(
         "/api/simulator/chat",
         headers=request_headers,
-        json={"messages": [message("user")]},
+        json={"messages": json_messages([message("user")])},
     )
 
     assert response.status_code == 401
@@ -280,7 +314,7 @@ def test_chat_route_rejects_invalid_body_before_service(
     response = simulator_client.post(
         "/api/simulator/chat",
         headers={"Authorization": f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key)}"},
-        json={"messages": [message("user", " ")]},
+        json={"messages": [raw_message("user", " ")]},
     )
 
     assert response.status_code == 422
@@ -331,7 +365,7 @@ def test_chat_route_maps_typed_errors_without_leaking_details(
     response = simulator_client.post(
         "/api/simulator/chat",
         headers={"Authorization": f"Bearer {token}"},
-        json={"messages": [message("user")]},
+        json={"messages": json_messages([message("user")])},
     )
 
     assert response.status_code == status
@@ -379,18 +413,24 @@ def test_chat_minute_rate_limit_is_per_user_and_stops_service(
 
     assert (
         simulator_client.post(
-            "/api/simulator/chat", headers=alice, json={"messages": [message("user")]}
+            "/api/simulator/chat",
+            headers=alice,
+            json={"messages": json_messages([message("user")])},
         ).status_code
         == 200
     )
     limited = simulator_client.post(
-        "/api/simulator/chat", headers=alice, json={"messages": [message("user")]}
+        "/api/simulator/chat",
+        headers=alice,
+        json={"messages": json_messages([message("user")])},
     )
     assert limited.status_code == 429
     assert limited.headers["Retry-After"] == "60"
     assert (
         simulator_client.post(
-            "/api/simulator/chat", headers=bob, json={"messages": [message("user")]}
+            "/api/simulator/chat",
+            headers=bob,
+            json={"messages": json_messages([message("user")])},
         ).status_code
         == 200
     )
@@ -426,13 +466,17 @@ def test_chat_daily_rate_limit_has_daily_retry_after(
 
     assert (
         simulator_client.post(
-            "/api/simulator/chat", headers=headers, json={"messages": [message("user")]}
+            "/api/simulator/chat",
+            headers=headers,
+            json={"messages": json_messages([message("user")])},
         ).status_code
         == 200
     )
     now[0] += 3600
     limited = simulator_client.post(
-        "/api/simulator/chat", headers=headers, json={"messages": [message("user")]}
+        "/api/simulator/chat",
+        headers=headers,
+        json={"messages": json_messages([message("user")])},
     )
     assert limited.status_code == 429
     assert limited.headers["Retry-After"] == "82800"
@@ -502,32 +546,37 @@ def test_bedrock_boundary_builds_bounded_converse_request_in_worker_thread() -> 
                 "output": {"message": {"role": "assistant", "content": [{"text": "Done."}]}},
             }
 
-    request = ChatRequest(messages=[message("user", "Remember this")])
-    messages = bedrock_messages(request.messages)
+    messages = [
+        ModelMessage(role="system", content=SYSTEM_PROMPT),
+        ModelMessage("user", "Remember this"),
+    ]
     tools = [
-        {
-            "toolSpec": {
-                "name": "remember",
-                "description": "Save a memory",
-                "inputSchema": {"json": {"type": "object"}},
-            }
-        }
+        ToolSpec(name, "Save a memory" if name == "remember" else f"Use {name}", {"type": "object"})
+        for name in EXPECTED_TOOLS
     ]
     fake = FakeBedrock()
 
     turn = asyncio.run(call_bedrock(messages, tools, client=fake))
 
-    assert turn == BedrockTurn(
-        message={"role": "assistant", "content": [{"text": "Done."}]},
-        stop_reason="end_turn",
-    )
+    assert turn == ModelTurn(text="Done.", finished=True)
     assert fake.thread != caller_thread
     assert fake.kwargs == {
         "modelId": "us.anthropic.claude-sonnet-5-5",
         "messages": [{"role": "user", "content": [{"text": "Remember this"}]}],
         "system": [{"text": SYSTEM_PROMPT}],
         "inferenceConfig": {"maxTokens": BEDROCK_MAX_OUTPUT_TOKENS},
-        "toolConfig": {"tools": tools},
+        "toolConfig": {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": name,
+                        "description": "Save a memory" if name == "remember" else f"Use {name}",
+                        "inputSchema": {"json": {"type": "object"}},
+                    }
+                }
+                for name in EXPECTED_TOOLS
+            ]
+        },
     }
 
 
@@ -552,9 +601,10 @@ def test_bedrock_boundary_accepts_tool_use_envelope() -> None:
                 },
             }
 
-    turn = asyncio.run(call_bedrock([], [], client=FakeBedrock()))
+    turn = asyncio.run(call_bedrock([], tool_specs(), client=FakeBedrock()))
 
-    assert turn.stop_reason == "tool_use"
+    assert turn.finished is False
+    assert turn.tool_calls == (ModelToolCall("call-1", "recall", {"query": "keys"}),)
 
 
 @pytest.mark.parametrize(
@@ -587,7 +637,7 @@ def test_bedrock_boundary_rejects_invalid_responses(response: object) -> None:
             return response
 
     with pytest.raises(InvalidModelOutputError):
-        asyncio.run(call_bedrock([], [], client=FakeBedrock()))
+        asyncio.run(call_bedrock([], tool_specs(), client=FakeBedrock()))
 
 
 @pytest.mark.parametrize(
@@ -618,7 +668,163 @@ def test_bedrock_boundary_maps_sdk_errors(
             raise error
 
     with pytest.raises(expected):
-        asyncio.run(call_bedrock([], [], client=FakeBedrock()))
+        asyncio.run(call_bedrock([], tool_specs(), client=FakeBedrock()))
+
+
+def test_ollama_adapter_translates_messages_tools_and_tool_results() -> None:
+    recall_call = ModelToolCall("stable-id", "recall", {"query": "passport"})
+    messages = [
+        ModelMessage("system", SYSTEM_PROMPT),
+        ModelMessage("user", "Where is my passport?"),
+        ModelMessage("assistant", "", tool_calls=(recall_call,)),
+        ModelMessage(
+            "tool",
+            '{"memories":[{"id":"memory-1"}]}',
+            tool_call_id="stable-id",
+            tool_name="recall",
+        ),
+    ]
+
+    converted_messages = _ollama_messages(messages)
+    converted_tools = _ollama_tools(tool_specs())
+
+    assert converted_messages == [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "Where is my passport?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "recall", "arguments": {"query": "passport"}}}],
+        },
+        {
+            "role": "tool",
+            "content": '{"memories":[{"id":"memory-1"}]}',
+            "tool_name": "recall",
+        },
+    ]
+    assert [entry["function"]["name"] for entry in converted_tools] == list(EXPECTED_TOOLS)
+    assert converted_tools[1]["function"]["parameters"] == {"type": "object"}
+
+
+def test_ollama_response_translation_accepts_json_object_arguments() -> None:
+    payload = {
+        "message": {
+            "role": "assistant",
+            "content": "I’ll check.",
+            "tool_calls": [
+                {"function": {"name": "recall", "arguments": '{"query":"passport"}'}},
+                {"function": {"name": "remember", "arguments": {"content": "x"}}},
+            ],
+        }
+    }
+
+    first = _ollama_model_turn(payload, turn_index=3)
+    second = _ollama_model_turn(payload, turn_index=3)
+
+    assert first == second
+    assert first.finished is False
+    assert first.text == "I’ll check."
+    assert first.tool_calls[0].arguments == {"query": "passport"}
+    assert first.tool_calls[0].tool_call_id.startswith("ollama-3-0-")
+    assert first.tool_calls[1].arguments == {"content": "x"}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "not-json",
+        "[]",
+        2,
+        None,
+        '{"value":NaN}',
+    ],
+)
+def test_ollama_response_rejects_non_object_tool_arguments(arguments: Any) -> None:
+    payload = {
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "recall", "arguments": arguments}}],
+        }
+    }
+    with pytest.raises(InvalidModelOutputError):
+        _ollama_model_turn(payload, turn_index=1)
+
+
+def test_ollama_response_translates_final_text_and_rejects_unlisted_tools() -> None:
+    final = _ollama_model_turn(
+        {"message": {"role": "assistant", "content": "  Hello.  "}}, turn_index=1
+    )
+    assert final == ModelTurn(text="Hello.", finished=True)
+
+    with pytest.raises(InvalidModelOutputError):
+        _ollama_model_turn(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "other", "arguments": {}}}],
+                }
+            },
+            turn_index=1,
+        )
+
+
+def test_ollama_provider_sends_api_chat_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"message": {"role": "assistant", "content": "Ready."}}
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout: httpx2.Timeout) -> None:
+            captured["timeout"] = timeout
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(self, url: str, *, json: dict[str, Any]) -> FakeResponse:
+            captured["url"] = url
+            captured["request"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(simulator_service.httpx2, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(settings, "ollama_host", "http://localhost:11434/")
+    monkeypatch.setattr(settings, "simulator_ollama_model", "llama3.1:8b")
+
+    turn = asyncio.run(OllamaProvider().complete([ModelMessage("user", "Hi")], tool_specs()))
+
+    assert turn == ModelTurn(text="Ready.", finished=True)
+    assert captured["url"] == "http://localhost:11434/api/chat"
+    assert captured["request"]["model"] == "llama3.1:8b"
+    assert captured["request"]["stream"] is False
+    assert captured["request"]["options"]["num_predict"] == BEDROCK_MAX_OUTPUT_TOKENS
+    assert captured["request"]["options"]["num_ctx"] == 4096
+    assert captured["request"]["options"]["num_batch"] == 128
+    assert len(captured["request"]["tools"]) == 3
+
+
+def test_ollama_tool_arguments_obey_shared_byte_bound() -> None:
+    oversized = {"content": "x" * MAX_TOOL_ARGUMENT_BYTES}
+    turn = _ollama_model_turn(
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "remember", "arguments": oversized}}],
+            }
+        },
+        turn_index=1,
+    )
+    with pytest.raises(InvalidModelOutputError):
+        _tool_requests(turn, seen_tool_use_ids=set(), completed_calls=0)
 
 
 def mcp_tool(name: str) -> Tool:
@@ -632,7 +838,7 @@ def mcp_tool(name: str) -> Tool:
 
 
 def test_mcp_catalog_converts_only_expected_tools_for_bedrock() -> None:
-    tools = [mcp_tool("remember"), mcp_tool("recall"), mcp_tool("forget")]
+    tools = tool_specs()
 
     converted = _bedrock_tools(tools)
 
@@ -641,7 +847,7 @@ def test_mcp_catalog_converts_only_expected_tools_for_bedrock() -> None:
         "recall",
         "forget",
     ]
-    assert converted[0]["toolSpec"]["inputSchema"] == {"json": {"type": "object", "properties": {}}}
+    assert converted[0]["toolSpec"]["inputSchema"] == {"json": {"type": "object"}}
 
 
 @pytest.mark.parametrize(
@@ -655,7 +861,7 @@ def test_mcp_catalog_converts_only_expected_tools_for_bedrock() -> None:
 )
 def test_mcp_catalog_rejects_missing_duplicate_or_unexpected_tools(tools: list[Tool]) -> None:
     with pytest.raises(UpstreamUnavailableError):
-        _bedrock_tools(tools)
+        simulator_service._tool_specs(tools)
 
 
 def test_mcp_tool_client_rejects_unapproved_names_without_calling_session() -> None:
@@ -666,7 +872,7 @@ def test_mcp_tool_client_rejects_unapproved_names_without_calling_session() -> N
             self.called = True
 
     session = FakeSession()
-    client = McpToolClient(session=session, bedrock_tools=[])  # type: ignore[arg-type]
+    client = McpToolClient(session=session, tools=[])  # type: ignore[arg-type]
 
     with pytest.raises(UpstreamUnavailableError):
         asyncio.run(client.call_tool("unknown", {}))
@@ -680,7 +886,7 @@ def test_mcp_tool_client_maps_protocol_errors_and_timeouts(
         async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
             raise RuntimeError("private protocol error")
 
-    failing = McpToolClient(session=FailingSession(), bedrock_tools=[])  # type: ignore[arg-type]
+    failing = McpToolClient(session=FailingSession(), tools=[])  # type: ignore[arg-type]
     with pytest.raises(UpstreamUnavailableError):
         asyncio.run(failing.call_tool("recall", {}))
 
@@ -689,7 +895,7 @@ def test_mcp_tool_client_maps_protocol_errors_and_timeouts(
             await asyncio.sleep(0.05)
 
     monkeypatch.setattr(simulator_service, "MCP_TIMEOUT_SECONDS", 0.001)
-    slow = McpToolClient(session=SlowSession(), bedrock_tools=[])  # type: ignore[arg-type]
+    slow = McpToolClient(session=SlowSession(), tools=[])  # type: ignore[arg-type]
     with pytest.raises(SimulatorTimeoutError):
         asyncio.run(slow.call_tool("recall", {}))
 
@@ -716,7 +922,7 @@ def test_mcp_boundary_uses_forwarded_token_and_real_in_process_endpoint(
 
     async def scenario() -> tuple[list[str], Any]:
         async with connect_mcp(token, http_client_factory=client_factory) as mcp:
-            names = [item["toolSpec"]["name"] for item in mcp.bedrock_tools]
+            names = [item.name for item in mcp.tools]
             recalled = await mcp.call_tool("recall", {"query": "nothing"})
             return names, recalled.structured_content
 
@@ -732,7 +938,7 @@ def test_mcp_boundary_uses_forwarded_token_and_real_in_process_endpoint(
 
 class ScriptedMcpClient:
     def __init__(self, results: list[CallToolResult | Exception]) -> None:
-        self.bedrock_tools: list[dict[str, Any]] = []
+        self.tools = tool_specs()
         self.results = results
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -745,44 +951,38 @@ class ScriptedMcpClient:
 
 
 def successful_tool_result(payload: dict[str, Any]) -> CallToolResult:
-    return CallToolResult(content=[], structuredContent=payload)
+    return CallToolResult.model_validate({"content": [], "structuredContent": payload})
 
 
-def tool_turn(*tool_uses: dict[str, Any]) -> BedrockTurn:
-    return BedrockTurn(
-        message={
-            "role": "assistant",
-            "content": [{"toolUse": tool_use} for tool_use in tool_uses],
-        },
-        stop_reason="tool_use",
+def tool_turn(*tool_uses: dict[str, Any]) -> ModelTurn:
+    return ModelTurn(
+        text="",
+        tool_calls=tuple(
+            ModelToolCall(use["toolUseId"], use["name"], use["input"]) for use in tool_uses
+        ),
     )
 
 
-def text_turn(text: str = "Done.") -> BedrockTurn:
-    return BedrockTurn(
-        message={"role": "assistant", "content": [{"text": text}]},
-        stop_reason="end_turn",
-    )
+def text_turn(text: str = "Done.") -> ModelTurn:
+    return ModelTurn(text=text, finished=True)
 
 
 def install_scripted_boundaries(
     monkeypatch: pytest.MonkeyPatch,
-    turns: list[BedrockTurn | Exception],
-    results: list[CallToolResult | Exception],
-) -> tuple[ScriptedMcpClient, list[list[dict[str, Any]]]]:
+    turns: list[ModelTurn | Exception] | tuple[ModelTurn | Exception, ...],
+    results: list[CallToolResult | Exception] | tuple[CallToolResult | Exception, ...],
+) -> tuple[ScriptedMcpClient, list[list[ModelMessage]]]:
     mcp = ScriptedMcpClient(results)
-    conversations: list[list[dict[str, Any]]] = []
+    conversations: list[list[ModelMessage]] = []
 
     @asynccontextmanager
     async def fake_connect(access_token: str) -> AsyncIterator[ScriptedMcpClient]:
         assert access_token == "exact-token"
         yield mcp
 
-    async def fake_call_bedrock(
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        **kwargs: Any,
-    ) -> BedrockTurn:
+    async def fake_call_model(
+        messages: list[ModelMessage], tools: list[ToolSpec], **kwargs: Any
+    ) -> ModelTurn:
         conversations.append(deepcopy(messages))
         turn = turns.pop(0)
         if isinstance(turn, Exception):
@@ -790,7 +990,7 @@ def install_scripted_boundaries(
         return turn
 
     monkeypatch.setattr(simulator_service, "connect_mcp", fake_connect)
-    monkeypatch.setattr(simulator_service, "call_bedrock", fake_call_bedrock)
+    monkeypatch.setattr(simulator_service, "call_model", fake_call_model)
     return mcp, conversations
 
 
@@ -802,7 +1002,12 @@ def test_run_chat_returns_text_without_tool_calls(monkeypatch: pytest.MonkeyPatc
 
     assert reply == ChatReply(reply="Ready.", tool_calls=[])
     assert mcp.calls == []
-    assert conversations == [bedrock_messages(request.messages)]
+    assert conversations == [
+        [
+            ModelMessage(role="system", content=SYSTEM_PROMPT),
+            ModelMessage(role="user", content="Hello"),
+        ]
+    ]
 
 
 def test_run_chat_executes_multiple_tool_rounds_and_preserves_results(
@@ -841,9 +1046,10 @@ def test_run_chat_executes_multiple_tool_rounds_and_preserves_results(
         ("recall", {"query": "keys"}),
         ("forget", {"memory_id": "memory-1"}),
     ]
-    first_results = conversations[1][-1]["content"]
-    assert first_results[1]["toolResult"]["content"] == [{"json": {"memories": [memory]}}]
-    assert first_results[1]["toolResult"]["status"] == "success"
+    recall_result = conversations[1][-1]
+    assert json.loads(recall_result.content) == {"memories": [memory]}
+    assert recall_result.role == "tool"
+    assert recall_result.tool_name == "recall"
 
 
 @pytest.mark.parametrize(
@@ -1008,9 +1214,9 @@ def test_run_chat_returns_tool_errors_to_bedrock_for_explanation(
     reply = asyncio.run(run_chat(request.messages, "exact-token"))
 
     assert reply.tool_calls[0].result == {"error": "I couldn't find that memory."}
-    tool_result = conversations[1][-1]["content"][0]["toolResult"]
-    assert tool_result["status"] == "error"
-    assert tool_result["content"] == [{"json": {"error": "I couldn't find that memory."}}]
+    tool_result = conversations[1][-1]
+    assert tool_result.role == "tool"
+    assert json.loads(tool_result.content) == {"error": "I couldn't find that memory."}
 
 
 def test_run_chat_enforces_overall_timeout(
@@ -1022,12 +1228,12 @@ def test_run_chat_enforces_overall_timeout(
     async def fake_connect(access_token: str) -> AsyncIterator[ScriptedMcpClient]:
         yield mcp
 
-    async def slow_bedrock(*args: Any, **kwargs: Any) -> BedrockTurn:
+    async def slow_model(*args: Any, **kwargs: Any) -> ModelTurn:
         await asyncio.sleep(0.05)
         return text_turn()
 
     monkeypatch.setattr(simulator_service, "connect_mcp", fake_connect)
-    monkeypatch.setattr(simulator_service, "call_bedrock", slow_bedrock)
+    monkeypatch.setattr(simulator_service, "call_model", slow_model)
     monkeypatch.setattr(simulator_service, "REQUEST_TIMEOUT_SECONDS", 0.001)
     request = ChatRequest(messages=[message("user")])
 
@@ -1047,7 +1253,7 @@ def test_run_chat_returns_partial_reply_on_timeout_after_confirmed_call(
     async def fake_connect(access_token: str) -> AsyncIterator[ScriptedMcpClient]:
         yield mcp
 
-    async def timed_bedrock(*args: Any, **kwargs: Any) -> BedrockTurn:
+    async def timed_model(*args: Any, **kwargs: Any) -> ModelTurn:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1058,7 +1264,7 @@ def test_run_chat_returns_partial_reply_on_timeout_after_confirmed_call(
         return text_turn()
 
     monkeypatch.setattr(simulator_service, "connect_mcp", fake_connect)
-    monkeypatch.setattr(simulator_service, "call_bedrock", timed_bedrock)
+    monkeypatch.setattr(simulator_service, "call_model", timed_model)
     monkeypatch.setattr(simulator_service, "REQUEST_TIMEOUT_SECONDS", 0.01)
     request = ChatRequest(messages=[message("user")])
 
@@ -1075,31 +1281,21 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class WorkflowBedrock:
+    class WorkflowProvider:
         def __init__(self) -> None:
             self.next_id = 1
             self.pending_tools: dict[str, str] = {}
             self.received_results: list[tuple[str, dict[str, Any]]] = []
 
-        def converse(self, **kwargs: Any) -> dict[str, Any]:
-            last_message = kwargs["messages"][-1]
-            last_block = last_message["content"][0]
-            if "toolResult" in last_block:
-                tool_result = last_block["toolResult"]
-                payload = tool_result["content"][0]["json"]
-                name = self.pending_tools.pop(tool_result["toolUseId"])
+        async def complete(self, messages: list[ModelMessage], tools: list[ToolSpec]) -> ModelTurn:
+            last_message = messages[-1]
+            if last_message.role == "tool":
+                payload = json.loads(last_message.content)
+                name = self.pending_tools.pop(last_message.tool_call_id or "")
                 self.received_results.append((name, payload))
-                return {
-                    "stopReason": "end_turn",
-                    "output": {
-                        "message": {
-                            "role": "assistant",
-                            "content": [{"text": f"Completed {name}."}],
-                        }
-                    },
-                }
+                return ModelTurn(text=f"Completed {name}.", finished=True)
 
-            prompt = last_block["text"]
+            prompt = last_message.content
             if prompt.startswith("Remember"):
                 name = "remember"
                 arguments = {
@@ -1118,28 +1314,15 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
             tool_use_id = f"workflow-{self.next_id}"
             self.next_id += 1
             self.pending_tools[tool_use_id] = name
-            return {
-                "stopReason": "tool_use",
-                "output": {
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "toolUse": {
-                                    "toolUseId": tool_use_id,
-                                    "name": name,
-                                    "input": arguments,
-                                }
-                            }
-                        ],
-                    }
-                },
-            }
+            return ModelTurn(
+                text="",
+                tool_calls=(ModelToolCall(tool_use_id, name, arguments),),
+            )
 
-    bedrock = WorkflowBedrock()
+    provider = WorkflowProvider()
     monkeypatch.setattr(memory_service, "get_table", lambda: ddb_table)
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
-    monkeypatch.setattr(simulator_service, "get_bedrock_client", lambda: bedrock)
+    monkeypatch.setattr(simulator_service, "get_model_provider", lambda: provider)
 
     def in_process_mcp_client(access_token: str) -> httpx2.AsyncClient:
         return httpx2.AsyncClient(
@@ -1161,7 +1344,7 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
     remembered = simulator_client.post(
         "/api/simulator/chat",
         headers=alice_headers,
-        json={"messages": [message("user", "Remember my keys")]},
+        json={"messages": json_messages([message("user", "Remember my keys")])},
     )
     assert remembered.status_code == 200, remembered.text
     memory_id = remembered.json()["tool_calls"][0]["result"]["memory_id"]
@@ -1171,7 +1354,7 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
     bob_recalled = simulator_client.post(
         "/api/simulator/chat",
         headers=bob_headers,
-        json={"messages": [message("user", "Recall keys for Bob")]},
+        json={"messages": json_messages([message("user", "Recall keys for Bob")])},
     )
     assert bob_recalled.status_code == 200, bob_recalled.text
     assert bob_recalled.json()["tool_calls"][0]["result"] == []
@@ -1179,7 +1362,7 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
     alice_recalled = simulator_client.post(
         "/api/simulator/chat",
         headers=alice_headers,
-        json={"messages": [message("user", "Recall keys for Alice")]},
+        json={"messages": json_messages([message("user", "Recall keys for Alice")])},
     )
     assert alice_recalled.status_code == 200, alice_recalled.text
     recalled_memories = alice_recalled.json()["tool_calls"][0]["result"]
@@ -1189,7 +1372,7 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
     forgotten = simulator_client.post(
         "/api/simulator/chat",
         headers=alice_headers,
-        json={"messages": [message("user", f"Forget {memory_id}")]},
+        json={"messages": json_messages([message("user", f"Forget {memory_id}")])},
     )
     assert forgotten.status_code == 200, forgotten.text
     assert forgotten.json()["tool_calls"][0]["result"] == {
@@ -1198,6 +1381,6 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
     }
     assert not ddb_table.get_item(Key={"pk": "USER#alice", "sk": f"MEM#{memory_id}"}).get("Item")
 
-    recall_results = [payload for name, payload in bedrock.received_results if name == "recall"]
+    recall_results = [payload for name, payload in provider.received_results if name == "recall"]
     assert recall_results[0] == {"memories": []}
     assert recall_results[1]["memories"][0]["id"] == memory_id
