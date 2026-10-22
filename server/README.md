@@ -61,6 +61,41 @@ or invalid inputs and unavailable storage produce a plain-language MCP tool
 error. This P0 endpoint uses preconfigured Cognito bearer tokens; MCP OAuth
 discovery and audience-bound tokens are separate integration work.
 
+## Alexa Simulator API
+
+`POST /api/simulator/chat` accepts an alternating transcript that starts and
+ends with a user message. Send 1–20 messages, with at most 2,000 characters per
+message and 12,000 characters across the transcript:
+
+```sh
+AUTH_HEADER="$(printf '%s %s' 'Bearer' "$COGNITO_ACCESS_TOKEN")"
+curl -X POST http://127.0.0.1:8000/api/simulator/chat \
+  -H "Authorization: $AUTH_HEADER" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Remember my keys are in the drawer"}]}'
+```
+
+The endpoint calls `BEDROCK_MODEL_ID` through the standard boto3 credential
+chain (for example, an ECS task role in AWS or a configured developer profile
+locally). It forwards the caller's exact Cognito bearer token to this server's
+Streamable HTTP `/mcp` endpoint, so MCP authentication—not request-body data—
+determines memory ownership. The simulator never calls the memory service
+directly.
+
+Each request is limited to three Bedrock Converse rounds, four total MCP tool
+calls, 4 KiB of JSON arguments per tool call, eight seconds per MCP operation,
+and 60 seconds overall. Converse output is capped at 512 tokens. Requests are
+also limited per authenticated user to 10 per rolling minute and 200 per
+rolling 24 hours, per server process. A `429` response includes a `Retry-After`
+value calculated from the oldest request still occupying that window.
+
+For local manual use, configure Cognito, `PUBLIC_BASE_URL`, AWS credentials,
+Bedrock model access, and `BEDROCK_MODEL_ID` in `server/.env`, then run
+`uv run fastapi dev app/main.py`. Automated simulator tests need no live AWS
+credentials, Bedrock access, or external MCP process: they use a scripted
+Bedrock client, the in-process `/mcp` ASGI transport, and Moto DynamoDB. Run
+them with `uv run pytest tests/test_simulator.py`.
+
 ## Memory API
 
 ```sh
