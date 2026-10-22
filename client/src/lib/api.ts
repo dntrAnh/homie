@@ -3,8 +3,9 @@
 import { useCallback } from "react"
 
 import { useAuth } from "@/lib/auth"
+import { env } from "@/lib/env"
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
+export type * from "./api/schema"
 
 export class ApiError extends Error {
   constructor(
@@ -12,6 +13,7 @@ export class ApiError extends Error {
     message: string,
   ) {
     super(message)
+    this.name = "ApiError"
   }
 }
 
@@ -28,20 +30,24 @@ function messageFor(status: number) {
  * start with `sub` so cached data never leaks across accounts.
  */
 export function useApi() {
-  const { session } = useAuth()
-  const token = session?.accessToken
-  const sub = session?.user.sub
+  const auth = useAuth()
+  const token = auth.session?.accessToken
+  const sub = auth.session?.user.sub
 
   const request = useCallback(
     async <T>(path: string, init: RequestInit & { json?: unknown } = {}) => {
+      if (!token || !auth.isSessionTokenActive(token)) {
+        window.dispatchEvent(new Event("homie:session-expired"))
+        throw new ApiError(401, messageFor(401))
+      }
       const { json, headers, ...rest } = init
       let res: Response
       try {
-        res = await fetch(`${API_URL}${path}`, {
+        res = await fetch(`${env.apiUrl}${path}`, {
           ...rest,
           headers: {
             ...(json !== undefined && { "Content-Type": "application/json" }),
-            ...(token && { Authorization: `Bearer ${token}` }),
+            Authorization: `Bearer ${token}`,
             ...headers,
           },
           body: json !== undefined ? JSON.stringify(json) : rest.body,
@@ -54,10 +60,14 @@ export function useApi() {
             : "You're offline. Reconnect and try again.",
         )
       }
+      if (res.status === 401) {
+        auth.invalidateSession(token)
+        window.dispatchEvent(new Event("homie:session-expired"))
+      }
       if (!res.ok) throw new ApiError(res.status, messageFor(res.status))
       return (res.status === 204 ? undefined : await res.json()) as T
     },
-    [token],
+    [auth, token],
   )
 
   return { request, sub, enabled: Boolean(sub) }

@@ -1,11 +1,77 @@
+import json
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread, local
 from typing import Any
+from unittest.mock import patch
+from uuid import uuid4
 
 import boto3
+import jwt
 import pytest
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi.testclient import TestClient
 from moto import mock_aws
 
 from app.config import settings
+from app.services import memory_service
+
+TEST_CLIENT_ID = "test-client"
+TEST_ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/test_pool"
+
+
+@pytest.fixture(scope="session")
+def app_client() -> Iterator[TestClient]:
+    """Keep the SDK's single-use MCP session manager running for the test session."""
+    from app.main import app
+
+    with patch.object(settings, "dynamodb_endpoint_url", None):
+        with TestClient(app, base_url="http://localhost:8000") as client:
+            yield client
+
+
+@pytest.fixture(scope="session")
+def test_signing_key() -> rsa.RSAPrivateKey:
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@pytest.fixture
+def fake_jwks_endpoint(
+    monkeypatch: pytest.MonkeyPatch, test_signing_key: rsa.RSAPrivateKey
+) -> Iterator[str]:
+    public_jwk = jwt.algorithms.RSAAlgorithm.to_jwk(test_signing_key.public_key(), as_dict=True)
+    public_jwk.update({"kid": "test-key", "use": "sig", "alg": "RS256"})
+    jwks = {"keys": [public_jwk]}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = json.dumps(jwks).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    issuer = TEST_ISSUER
+    monkeypatch.setattr(type(settings), "cognito_issuer", property(lambda _self: issuer))
+    monkeypatch.setattr(
+        type(settings),
+        "cognito_jwks_url",
+        property(lambda _self: f"http://127.0.0.1:{server.server_port}/jwks"),
+    )
+    monkeypatch.setattr(settings, "cognito_client_ids", [TEST_CLIENT_ID])
+    yield issuer
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +87,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "aws_region", "us-east-1")
     monkeypatch.setattr(settings, "dynamodb_table", "homie-test")
     monkeypatch.setattr(settings, "dynamodb_endpoint_url", None)
+    monkeypatch.setattr(memory_service, "_thread", local())
 
 
 @pytest.fixture
@@ -40,6 +107,46 @@ def ddb_table() -> Iterator[Any]:
             BillingMode="PAY_PER_REQUEST",
         )
         yield table
+
+
+@pytest.fixture
+def ddb_local_table() -> Iterator[Any]:
+    endpoint_url = "http://127.0.0.1:8001"
+    client = boto3.client(
+        "dynamodb",
+        region_name=settings.aws_region,
+        endpoint_url=endpoint_url,
+        config=Config(connect_timeout=1, read_timeout=1, retries={"max_attempts": 0}),
+    )
+    try:
+        client.list_tables()
+    except BotoCoreError as exc:
+        pytest.skip(f"DynamoDB Local is not running at {endpoint_url}: {exc}")
+
+    table_name = f"homie-integration-{uuid4().hex}"
+    try:
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table = boto3.resource(
+            "dynamodb", region_name=settings.aws_region, endpoint_url=endpoint_url
+        ).Table(table_name)
+        table.wait_until_exists()
+        yield table
+    finally:
+        try:
+            client.delete_table(TableName=table_name)
+        except ClientError:
+            pass
 
 
 @pytest.fixture

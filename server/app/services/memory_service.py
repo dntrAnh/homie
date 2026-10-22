@@ -1,74 +1,129 @@
+import hashlib
+import json
 import logging
+import re
+import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from threading import local
+from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
 
 import boto3
 from boto3.dynamodb.conditions import Key
-from botocore.exceptions import ClientError
-from pydantic import TypeAdapter
+from botocore.exceptions import ClientError, EndpointConnectionError
+from pydantic import TypeAdapter, ValidationError
 
 from app.config import settings
-from app.models.memory import Limit, Memory, MemoryCreate, MemoryUpdate, Skip, Tags
+from app.models.memory import Kind, Limit, Memory, MemoryCreate, MemoryUpdate
 from app.models.user import Profile, UserSub
 
 logger = logging.getLogger(__name__)
 
 _user_sub_adapter = TypeAdapter(UserSub)
-_skip_adapter = TypeAdapter(Skip)
 _limit_adapter = TypeAdapter(Limit)
-_tags_adapter = TypeAdapter(Tags)
+_kind_adapter = TypeAdapter(Kind)
+_MAX_ITEMS = 2000
+_Ranked = TypeVar("_Ranked")
+_STOPWORDS = frozenset(
+    "a an and are at did do does for i in is it its me my of on or put the this to was "
+    "were what when where which who why you your left keep kept".split()
+)
+# boto3 resources and the default session are not thread-safe; sync routes run in a threadpool.
+_thread = local()
 
 
 class MemoryNotFoundError(Exception):
     pass
 
 
+class IdempotencyConflictError(Exception):
+    pass
+
+
+class IdempotencyInProgressError(Exception):
+    pass
+
+
+class IdempotencyRecordDeletedError(Exception):
+    pass
+
+
+class AccountDeletingError(Exception):
+    pass
+
+
+# Marker item that exists while DELETE /api/me is wiping the user's records.
+DELETING_SK = "DELETING"
+
+
+def write_unless_deleting(table: Any, user_sub: str, items: list[dict[str, Any]]) -> None:
+    """Transact `items` only if the user's account is not being deleted."""
+    check = {
+        "ConditionCheck": {
+            "TableName": table.name,
+            "Key": {"pk": f"USER#{user_sub}", "sk": DELETING_SK},
+            "ConditionExpression": "attribute_not_exists(pk)",
+        }
+    }
+    try:
+        table.meta.client.transact_write_items(TransactItems=[*items, check])
+    except ClientError as exc:
+        reasons = exc.response.get("CancellationReasons", [])
+        if len(reasons) == len(items) + 1 and reasons[-1].get("Code") == "ConditionalCheckFailed":
+            raise AccountDeletingError("Account deletion in progress") from exc
+        raise
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def new_id() -> str:
-    if hasattr(uuid, "uuid7"):
-        return str(uuid.uuid7())
-    return str(uuid.uuid4())
-
-
 def get_dynamodb_resource() -> Any:
-    kwargs: dict[str, Any] = {"region_name": settings.aws_region}
-    if settings.dynamodb_endpoint_url:
-        kwargs["endpoint_url"] = settings.dynamodb_endpoint_url
-    return boto3.resource("dynamodb", **kwargs)
+    return boto3.session.Session().resource(
+        "dynamodb", region_name=settings.aws_region, endpoint_url=settings.dynamodb_endpoint_url
+    )
 
 
 def get_table() -> Any:
-    return get_dynamodb_resource().Table(settings.dynamodb_table)
+    if getattr(_thread, "table", None) is None:
+        _thread.table = get_dynamodb_resource().Table(settings.dynamodb_table)
+    return _thread.table
 
 
-def ensure_table() -> None:
+def ensure_table(attempts: int = 10, delay: float = 1.0) -> None:
     ddb = get_dynamodb_resource()
-    try:
-        ddb.create_table(
-            TableName=settings.dynamodb_table,
-            KeySchema=[
-                {"AttributeName": "pk", "KeyType": "HASH"},
-                {"AttributeName": "sk", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "sk", "AttributeType": "S"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] not in (
-            "ResourceInUseException",
-            "TableAlreadyExistsException",
-        ):
-            logger.warning("Could not auto-create DynamoDB table: %s", exc)
-    except Exception as exc:
-        logger.warning("Could not auto-create DynamoDB table: %s", exc)
+    for attempt in range(attempts):
+        try:
+            ddb.create_table(
+                TableName=settings.dynamodb_table,
+                KeySchema=[
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"},
+                ],
+                AttributeDefinitions=[
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"},
+                ],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            return
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceInUseException":
+                return
+            raise
+        except EndpointConnectionError:
+            # DynamoDB Local may still be starting; fail startup loudly if it never comes up.
+            if attempt == attempts - 1:
+                raise
+            logger.warning("Waiting for DynamoDB at %s", settings.dynamodb_endpoint_url)
+            time.sleep(delay)
+
+
+def _parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class MemoryService:
@@ -79,83 +134,164 @@ class MemoryService:
         return _user_sub_adapter.validate_python(user_sub)
 
     def _timezone(self, user_sub: str) -> tuple[str, ZoneInfo]:
+        item = self.table.get_item(Key={"pk": f"USER#{user_sub}", "sk": "PROFILE"}).get("Item")
         try:
-            response = self.table.get_item(Key={"pk": f"USER#{user_sub}", "sk": "PROFILE"})
-            item = response.get("Item")
-            if item and "timezone" in item:
-                tz_name = Profile(timezone=item["timezone"]).timezone
-                return tz_name, ZoneInfo(tz_name)
-        except Exception:
-            pass
-        return "UTC", ZoneInfo("UTC")
+            tz_name = Profile(timezone=item["timezone"]).timezone if item else "UTC"
+        except KeyError, ValidationError:
+            logger.warning("Invalid stored profile timezone; using UTC")
+            tz_name = "UTC"
+        return tz_name, ZoneInfo(tz_name)
 
     @staticmethod
     def _to_memory(record: dict[str, Any], timezone: str, zone: ZoneInfo) -> Memory:
-        created_raw = record["created_at"]
-        if isinstance(created_raw, datetime):
-            created_dt = created_raw
-        else:
-            created_dt = datetime.fromisoformat(str(created_raw))
-        if created_dt.tzinfo is None:
-            created_dt = created_dt.replace(tzinfo=UTC)
-
-        updated_raw = record["updated_at"]
-        if isinstance(updated_raw, datetime):
-            updated_dt = updated_raw
-        else:
-            updated_dt = datetime.fromisoformat(str(updated_raw))
-        if updated_dt.tzinfo is None:
-            updated_dt = updated_dt.replace(tzinfo=UTC)
-
         return Memory(
             id=record["id"],
             user_sub=record["user_sub"],
             content=record["content"],
-            memory_type=record.get("memory_type") or record.get("kind", ""),
+            kind=record["kind"],
             tags=list(record.get("tags", [])),
-            created_at=created_dt.astimezone(zone),
-            updated_at=updated_dt.astimezone(zone),
+            event_id=record.get("event_id"),
+            media_ids=list(record.get("media_ids", [])),
+            created_at=_parse_utc(record["created_at"]).astimezone(zone),
+            updated_at=_parse_utc(record["updated_at"]).astimezone(zone),
             timezone=timezone,
         )
 
     def create_memory(
-        self, user_sub: str, content: str, memory_type: str, tags: list[str]
+        self,
+        user_sub: str,
+        content: str,
+        kind: Kind,
+        tags: list[str],
+        event_id: str | None = None,
+        request_id: uuid.UUID | str | None = None,
     ) -> Memory:
         user_sub = self._validate_sub(user_sub)
-        data = MemoryCreate(content=content, memory_type=memory_type, tags=tags)
-
+        data = MemoryCreate(content=content, kind=kind, tags=tags, event_id=event_id)
+        # A missing PROFILE means defaults (UTC); profiles are created by the profile endpoint.
+        memory_id = str(uuid.uuid7())
         now_iso = utc_now().isoformat()
-        try:
-            self.table.put_item(
-                Item={
-                    "pk": f"USER#{user_sub}",
-                    "sk": "PROFILE",
-                    "timezone": "UTC",
-                    "created_at": now_iso,
-                    "updated_at": now_iso,
-                },
-                ConditionExpression="attribute_not_exists(pk)",
-            )
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
-                raise
-
-        memory_id = new_id()
-        deduped_tags = list(dict.fromkeys(data.tags))
         item = {
             "pk": f"USER#{user_sub}",
             "sk": f"MEM#{memory_id}",
             "id": memory_id,
             "user_sub": user_sub,
             "content": data.content,
-            "memory_type": data.memory_type,
-            "kind": data.memory_type,
-            "tags": deduped_tags,
+            "kind": data.kind,
+            "tags": data.tags,
+            "media_ids": [],
             "created_at": now_iso,
             "updated_at": now_iso,
         }
-        self.table.put_item(Item=item)
+        if data.event_id is not None:
+            item["event_id"] = data.event_id
+
+        if request_id is not None:
+            request_uuid = uuid.UUID(str(request_id))
+            request_sk = f"REQUEST#create-memory#{request_uuid}"
+            request_item = {
+                "pk": f"USER#{user_sub}",
+                "sk": request_sk,
+                "memory_id": memory_id,
+                "payload_hash": self._payload_hash(data),
+                "created_at": now_iso,
+            }
+            existing = self.table.get_item(
+                Key={"pk": request_item["pk"], "sk": request_sk}, ConsistentRead=True
+            ).get("Item")
+            if existing:
+                return self._resolve_idempotent_replay(
+                    user_sub, existing, request_item["payload_hash"]
+                )
+
+            try:
+                write_unless_deleting(
+                    self.table,
+                    user_sub,
+                    [
+                        {
+                            "Put": {
+                                "TableName": self.table.name,
+                                "Item": item,
+                                "ConditionExpression": "attribute_not_exists(pk)",
+                            }
+                        },
+                        {
+                            "Put": {
+                                "TableName": self.table.name,
+                                "Item": request_item,
+                                "ConditionExpression": "attribute_not_exists(pk)",
+                            }
+                        },
+                    ],
+                )
+            except ClientError as exc:
+                # Only treat a failed transaction as a replay if its request record now exists.
+                existing = self.table.get_item(
+                    Key={"pk": request_item["pk"], "sk": request_sk}, ConsistentRead=True
+                ).get("Item")
+                if existing:
+                    return self._resolve_idempotent_replay(
+                        user_sub, existing, request_item["payload_hash"]
+                    )
+                if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+                    raise IdempotencyInProgressError("Request in progress, try again") from exc
+                raise
+        else:
+            write_unless_deleting(
+                self.table, user_sub, [{"Put": {"TableName": self.table.name, "Item": item}}]
+            )
         return self._to_memory(item, *self._timezone(user_sub))
+
+    @staticmethod
+    def _payload_hash(data: MemoryCreate) -> str:
+        canonical = json.dumps(data.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _resolve_idempotent_replay(
+        self, user_sub: str, request_item: dict[str, Any], payload_hash: str
+    ) -> Memory:
+        if request_item["payload_hash"] != payload_hash:
+            raise IdempotencyConflictError("Idempotency key was already used with another payload")
+        response = self.table.get_item(
+            Key={"pk": f"USER#{user_sub}", "sk": f"MEM#{request_item['memory_id']}"},
+            ConsistentRead=True,
+        )
+        item = response.get("Item")
+        if item is None:
+            raise IdempotencyRecordDeletedError("The memory created by this request was deleted")
+        # P0 intentionally replays the memory's latest state, even if it changed after creation.
+        return self._to_memory(item, *self._timezone(user_sub))
+
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        return {
+            word.removesuffix("s") if len(word) > 3 else word
+            for word in re.findall(r"[a-z0-9]+", text.lower())
+            if word not in _STOPWORDS
+        }
+
+    @classmethod
+    def _rank_records(cls, records: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+        return cls._rank_items(
+            records,
+            query,
+            lambda record: f"{record['content']} {' '.join(record.get('tags', []))}",
+        )
+
+    @classmethod
+    def _rank_items(
+        cls, items: list[_Ranked], query: str, text: Callable[[_Ranked], str]
+    ) -> list[_Ranked]:
+        query_tokens = cls._tokens(query)
+        if not query_tokens:
+            return []
+        scored = [(len(query_tokens & cls._tokens(text(item))), item) for item in items]
+        return [
+            item
+            for score, item in sorted(scored, key=lambda entry: entry[0], reverse=True)
+            if score
+        ]
 
     def get_memory(self, user_sub: str, memory_id: str) -> Memory:
         user_sub = self._validate_sub(user_sub)
@@ -167,40 +303,85 @@ class MemoryService:
             raise MemoryNotFoundError("Memory not found")
         return self._to_memory(item, *self._timezone(user_sub))
 
-    def list_memories(
-        self,
-        user_sub: str,
-        skip: int = 0,
-        limit: int = 50,
-        tags: list[str] | None = None,
-    ) -> list[Memory]:
-        user_sub = self._validate_sub(user_sub)
-        _skip_adapter.validate_python(skip)
-        _limit_adapter.validate_python(limit)
-        validated_tags: list[str] | None = None
-        if tags is not None:
-            validated_tags = _tags_adapter.validate_python(tags)
+    def _read_memory_records(
+        self, user_sub: str, *, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        # UUIDv7 sort keys are time-ordered, so a descending query is newest-first.
+        query_kwargs: dict[str, Any] = {
+            "KeyConditionExpression": Key("pk").eq(f"USER#{user_sub}")
+            & Key("sk").begins_with("MEM#"),
+            "ScanIndexForward": False,
+        }
+        if limit is not None:
+            items: list[dict[str, Any]] = []
+            while len(items) < limit:
+                query_kwargs["Limit"] = limit - len(items)
+                response = self.table.query(**query_kwargs)
+                items.extend(response.get("Items", []))
+                if "LastEvaluatedKey" not in response:
+                    break
+                query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+            return items[:limit]
 
-        key_cond = Key("pk").eq(f"USER#{user_sub}") & Key("sk").begins_with("MEM#")
-        query_kwargs: dict[str, Any] = {"KeyConditionExpression": key_cond}
         items: list[dict[str, Any]] = []
-        while True:
+        while len(items) < _MAX_ITEMS:
+            query_kwargs["Limit"] = _MAX_ITEMS - len(items)
             response = self.table.query(**query_kwargs)
             items.extend(response.get("Items", []))
-            if "LastEvaluatedKey" not in response or len(items) >= 2000:
+            if "LastEvaluatedKey" not in response or len(items) >= _MAX_ITEMS:
                 break
             query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
-        if validated_tags is not None:
-            unique_tags = list(dict.fromkeys(validated_tags))
-            if unique_tags:
-                req_tags_set = set(unique_tags)
-                items = [i for i in items if req_tags_set.issubset(set(i.get("tags", [])))]
+        return items[:_MAX_ITEMS]
 
-        items.sort(key=lambda x: (x.get("created_at", ""), x.get("id", "")), reverse=True)
-        sliced = items[skip : skip + limit]
+    def _to_memories(self, user_sub: str, records: list[dict[str, Any]]) -> list[Memory]:
+        if not records:
+            return []
         timezone, zone = self._timezone(user_sub)
-        return [self._to_memory(item, timezone, zone) for item in sliced]
+        return [self._to_memory(record, timezone, zone) for record in records]
+
+    def list_memories(
+        self,
+        user_sub: str,
+        kind: Kind | None = None,
+        query: str | None = None,
+        limit: int = 50,
+    ) -> list[Memory]:
+        user_sub = self._validate_sub(user_sub)
+        _limit_adapter.validate_python(limit)
+        if kind is not None:
+            _kind_adapter.validate_python(kind)
+        has_query = bool(query and query.strip())
+        records = self._read_memory_records(
+            user_sub,
+            limit=limit if kind is None and not has_query else None,
+        )
+        if kind is not None:
+            records = [record for record in records if record["kind"] == kind]
+        if has_query:
+            records = self._rank_records(records, query.strip())
+        return self._to_memories(user_sub, records[:limit])
+
+    def recall(
+        self, user_sub: str, query: str, kind: Kind | None = None, limit: int = 10
+    ) -> list[Memory]:
+        _limit_adapter.validate_python(limit)
+        user_sub = self._validate_sub(user_sub)
+        if kind is not None:
+            _kind_adapter.validate_python(kind)
+
+        result_limit = min(limit, 10)
+        search_query = query.strip()
+        records = self._read_memory_records(
+            user_sub, limit=result_limit if kind is None and not search_query else None
+        )
+        if kind is not None:
+            records = [record for record in records if record["kind"] == kind]
+        if search_query:
+            ranked = self._rank_records(records, search_query)
+            if ranked:
+                records = ranked
+        return self._to_memories(user_sub, records[:result_limit])
 
     def update_memory(self, user_sub: str, memory_id: str, **updates: Any) -> Memory:
         user_sub = self._validate_sub(user_sub)
@@ -210,52 +391,49 @@ class MemoryService:
 
         changes = data.model_dump(exclude_unset=True)
         sets: dict[str, Any] = {}
-        for k, v in changes.items():
-            if k == "tags":
-                sets["tags"] = list(dict.fromkeys(v))
-            elif k == "memory_type":
-                sets["memory_type"] = v
-                sets["kind"] = v
+        if "content" in changes:
+            sets["content"] = changes["content"]
+        if "kind" in changes:
+            sets["kind"] = changes["kind"]
+        if "tags" in changes:
+            sets["tags"] = changes["tags"]
+        removes: list[str] = []
+        if "event_id" in changes:
+            if changes["event_id"] is None:
+                removes.append("event_id")
             else:
-                sets[k] = v
+                sets["event_id"] = changes["event_id"]
         sets["updated_at"] = utc_now().isoformat()
-
-        update_expr = "SET " + ", ".join(f"#{k} = :{k}" for k in sets)
-        expr_attr_names = {f"#{k}": k for k in sets}
-        expr_attr_values = {f":{k}": v for k, v in sets.items()}
+        expression = "SET " + ", ".join(f"#{k} = :{k}" for k in sets)
+        if removes:
+            expression += " REMOVE " + ", ".join(f"#{key}" for key in removes)
 
         try:
             response = self.table.update_item(
                 Key={"pk": f"USER#{user_sub}", "sk": f"MEM#{memory_id}"},
-                UpdateExpression=update_expr,
+                UpdateExpression=expression,
                 ConditionExpression="attribute_exists(pk) AND attribute_exists(sk)",
-                ExpressionAttributeNames=expr_attr_names,
-                ExpressionAttributeValues=expr_attr_values,
+                ExpressionAttributeNames={f"#{k}": k for k in [*sets, *removes]},
+                ExpressionAttributeValues={f":{k}": v for k, v in sets.items()},
                 ReturnValues="ALL_NEW",
             )
-            item = response["Attributes"]
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise MemoryNotFoundError("Memory not found") from exc
             raise
-        return self._to_memory(item, *self._timezone(user_sub))
+        return self._to_memory(response["Attributes"], *self._timezone(user_sub))
 
     def delete_memory(self, user_sub: str, memory_id: str) -> bool:
+        user_sub = self._validate_sub(user_sub)
         if not memory_id:
             return False
         try:
-            user_sub = self._validate_sub(user_sub)
-        except Exception:
-            return False
-
-        try:
-            response = self.table.delete_item(
+            self.table.delete_item(
                 Key={"pk": f"USER#{user_sub}", "sk": f"MEM#{memory_id}"},
                 ConditionExpression="attribute_exists(pk) AND attribute_exists(sk)",
-                ReturnValues="ALL_OLD",
             )
-            return "Attributes" in response
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return False
             raise
+        return True

@@ -165,7 +165,15 @@ function SettingsForm({ profile }: { profile: Profile }) {
                 {session?.user.email}
               </p>
             </div>
-            <Button variant="outline" size="lg" onClick={signOut}>
+            <Button
+              variant="outline"
+              size="lg"
+              onClick={() =>
+                void signOut().catch(() =>
+                  toast.error("Couldn't sign out. Please try again."),
+                )
+              }
+            >
               <LogOut aria-hidden /> Sign out
             </Button>
           </div>

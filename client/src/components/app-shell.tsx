@@ -12,6 +12,7 @@ import {
 } from "lucide-react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
+import { toast } from "sonner"
 
 import { initials, useAuth } from "@/lib/auth"
 import { useOnline } from "@/lib/pwa"
@@ -35,6 +36,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const online = useOnline()
   const { session, signOut } = useAuth()
   const user = session?.user
+  const handleSignOut = () => {
+    void signOut().catch(() =>
+      toast.error("Couldn't sign out. Please try again."),
+    )
+  }
   const links = NAV.map((item) => ({
     ...item,
     active: pathname.startsWith(item.href),
@@ -95,7 +101,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
             <button
               type="button"
-              onClick={signOut}
+              onClick={handleSignOut}
               aria-label="Sign out"
               className="focus-visible:ring-sidebar-ring grid size-11 place-items-center rounded-lg text-[#afc2b7] outline-none hover:text-white focus-visible:ring-2"
             >

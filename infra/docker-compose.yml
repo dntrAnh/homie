@@ -1,7 +1,12 @@
 services:
   dynamodb:
-    image: amazon/dynamodb-local:latest
-    command: "-jar DynamoDBLocal.jar -sharedDb"
+    image: amazon/dynamodb-local:3.3.1
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath ./data"
+    # The image runs as uid 1000 but a new named volume is root-owned.
+    user: root
+    working_dir: /home/dynamodblocal
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
     ports: ["8001:8000"]
 
   server:
@@ -23,7 +28,28 @@ services:
       context: ../client
       dockerfile: ../infra/docker/client.Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_COGNITO_AUTHORITY: ${NEXT_PUBLIC_COGNITO_AUTHORITY:-}
+        NEXT_PUBLIC_COGNITO_CLIENT_ID: ${NEXT_PUBLIC_COGNITO_CLIENT_ID:-}
+        NEXT_PUBLIC_COGNITO_DOMAIN: ${NEXT_PUBLIC_COGNITO_DOMAIN:-}
+        NEXT_PUBLIC_COGNITO_SCOPE: ${NEXT_PUBLIC_COGNITO_SCOPE:-openid email profile homie/mcp:tools}
     ports: ["3000:3000"]
     depends_on: [server]
 
+  caddy:
+    image: caddy:2-alpine
+    profiles: [phone-test]
+    ports: ["127.0.0.1:8080:80"]
+    volumes:
+      - ./caddy/dev.Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on: [client, server]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: [phone-test]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    depends_on: [caddy]
+
+volumes:
+  dynamodb-data:
