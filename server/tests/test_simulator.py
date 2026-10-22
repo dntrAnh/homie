@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import Iterator
 from threading import get_ident
 from time import time
@@ -282,22 +283,25 @@ def test_chat_route_rejects_invalid_body_before_service(
 
 
 @pytest.mark.parametrize(
-    ("error", "status", "detail"),
+    ("error", "status", "detail", "error_type"),
     [
         (
             InvalidModelOutputError("private model output"),
             502,
             "The simulator returned an invalid response. Please try again.",
+            "invalid_model_output",
         ),
         (
             UpstreamUnavailableError("private upstream error"),
             503,
             "The simulator is temporarily unavailable. Please try again.",
+            "upstream_unavailable",
         ),
         (
             SimulatorTimeoutError("private timeout"),
             504,
             "The simulator timed out. Please try again.",
+            "timeout",
         ),
     ],
 )
@@ -306,23 +310,41 @@ def test_chat_route_maps_typed_errors_without_leaking_details(
     fake_jwks_endpoint: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     error: SimulatorServiceError,
     status: int,
     detail: str,
+    error_type: str,
 ) -> None:
     async def fake_run_chat(messages: list[Any], access_token: str) -> ChatReply:
         raise error
 
     monkeypatch.setattr(simulator_route, "run_chat", fake_run_chat)
+    token = signed_token(fake_jwks_endpoint, test_signing_key)
+    caplog.set_level(logging.WARNING, logger=simulator_route.__name__)
     response = simulator_client.post(
         "/api/simulator/chat",
-        headers={"Authorization": f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key)}"},
+        headers={"Authorization": f"Bearer {token}"},
         json={"messages": [message("user")]},
     )
 
     assert response.status_code == status
     assert response.json() == {"detail": detail}
     assert str(error) not in response.text
+    failure_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "simulator_request_failed"
+    ]
+    assert len(failure_records) == 1
+    record = failure_records[0]
+    assert record.error_type == error_type
+    assert record.status_code == status
+    assert record.component == "simulator"
+    assert record.exc_info is None
+    assert str(error) not in caplog.text
+    assert token not in caplog.text
+    assert "Hello" not in caplog.text
 
 
 def test_chat_minute_rate_limit_is_per_user_and_stops_service(
