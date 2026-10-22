@@ -1,6 +1,7 @@
 import { Bell, CalendarDays, ChevronRight, HouseHeart } from "lucide-react"
 
 import type { CalendarEvent } from "@/lib/api/calendar"
+import { useTimezone } from "@/lib/api/profile"
 import { cn } from "@/lib/utils"
 
 function duration(event: CalendarEvent) {
@@ -16,11 +17,13 @@ function duration(event: CalendarEvent) {
 export function EventRow({ event }: { event: CalendarEvent }) {
   const homie = event.created_by_homie
   const Icon = homie ? Bell : CalendarDays
+  const timeZone = useTimezone()
   const time = event.all_day
     ? "All day"
     : new Date(event.start).toLocaleTimeString(undefined, {
         hour: "numeric",
         minute: "2-digit",
+        timeZone,
       })
   const meta = event.all_day
     ? "Reminder"

@@ -27,6 +27,7 @@ import {
   useDeleteMemory,
   useSaveMemory,
 } from "@/lib/api/memories"
+import { ApiError } from "@/lib/api"
 import { formatStamp } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -46,6 +47,11 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
   const [tagDraft, setTagDraft] = useState("")
   // One key per editor session: retries after a lost response reuse it.
   const [requestId] = useState(() => crypto.randomUUID())
+  // A create that failed with no response or a 5xx may have been committed, so
+  // the body is frozen until a retry succeeds; editing would make the reused
+  // key conflict (409), and a new key could save the memory twice.
+  const [uncertain, setUncertain] = useState(false)
+  const locked = !memory && (save.isPending || uncertain)
 
   const dirty =
     content !== (memory?.content ?? "") ||
@@ -92,7 +98,16 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
           if (!memory) router.replace(`/memories/${saved.id}`)
         },
         // Input stays as typed so nothing is lost.
-        onError: (err) => toast.error(err.message),
+        onError: (err) => {
+          if (
+            !memory &&
+            err instanceof ApiError &&
+            (err.status === 0 || err.status >= 500)
+          ) {
+            setUncertain(true)
+          }
+          toast.error(err.message)
+        },
       },
     )
   }
@@ -102,7 +117,9 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
     ? "Saving…"
     : memory
       ? "Save changes"
-      : "Save memory"
+      : uncertain
+        ? "Retry save"
+        : "Save memory"
 
   return (
     <div className="flex min-h-full flex-1 flex-col">
@@ -141,6 +158,15 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
                 Last updated {formatStamp(memory.updated_at)}
               </p>
             )}
+            {uncertain && (
+              <p
+                role="status"
+                className="text-muted-foreground mt-1 text-[13px]"
+              >
+                We couldn&apos;t confirm this saved. Retry to finish; editing is
+                paused so it isn&apos;t saved twice.
+              </p>
+            )}
           </div>
           <Button
             size="lg"
@@ -162,6 +188,7 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
                 id="memory-content"
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
+                disabled={locked}
                 maxLength={10_000}
                 required
                 placeholder="My passport is in the top desk drawer"
@@ -187,6 +214,7 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
                     aria-label="Type"
                     value={kind}
                     onChange={(e) => setKind(e.target.value as MemoryKind)}
+                    disabled={locked}
                     className="bg-muted md:bg-card focus-visible:border-ring focus-visible:ring-ring/50 h-12 w-full appearance-none rounded-lg border pr-10 pl-10 text-base outline-none focus-visible:ring-3 md:text-sm"
                   >
                     {KIND_ORDER.map((k) => (
@@ -220,6 +248,7 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
                         type="button"
                         aria-label={`Remove tag ${tag}`}
                         onClick={() => setTags(tags.filter((t) => t !== tag))}
+                        disabled={locked}
                         className="grid size-7 place-items-center rounded-full hover:bg-black/5"
                       >
                         <X className="size-3" aria-hidden />
@@ -239,7 +268,7 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
                       }
                     }}
                     onBlur={() => tagDraft && addTag(tagDraft)}
-                    disabled={tags.length >= MAX_TAGS}
+                    disabled={locked || tags.length >= MAX_TAGS}
                     placeholder={
                       tags.length >= MAX_TAGS
                         ? "Tag limit reached"

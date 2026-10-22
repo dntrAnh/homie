@@ -19,8 +19,10 @@ export type CalendarEvent = {
 
 export type ReminderInput = {
   title: string
-  /** ISO datetime, or YYYY-MM-DD for an all-day reminder. */
+  /** Local wall-clock `YYYY-MM-DDTHH:mm` (no offset), or `YYYY-MM-DD` for all-day. */
   when: string
+  /** IANA zone `when` is in. */
+  timezone: string
   notes?: string
 }
 
@@ -36,8 +38,8 @@ export function useEvents(days = 14) {
   })
 }
 
-// dev-note: assumes POST /api/calendar/reminders mirroring the
-// `create_reminder` MCP tool; the REST surface doesn't define it yet.
+// Contract: spec §7 `POST /api/calendar/reminders`, same rules as the
+// `create_reminder` MCP tool.
 export function useCreateReminder() {
   const { request, sub } = useApi()
   const qc = useQueryClient()

@@ -18,33 +18,32 @@ import { mobileActionClass, PageHeader } from "@/components/page-header"
 import { Button } from "@/components/ui/button"
 import { type CalendarEvent, useEvents } from "@/lib/api/calendar"
 import { useConnectGoogle, useGoogleStatus } from "@/lib/api/google"
+import { useTimezone } from "@/lib/api/profile"
 import { cn } from "@/lib/utils"
 
 const DAYS = 14
 
-// dev-note: dates use the browser's zone; switch to PROFILE.timezone once
-// /api/me/profile is wired so Alexa and the dashboard always agree.
-function dayKey(date: Date) {
-  return date.toLocaleDateString("en-CA") // YYYY-MM-DD
-}
-
-function startOfToday() {
-  const d = new Date()
-  d.setHours(0, 0, 0, 0)
-  return d
+// Days are calendar dates in the profile's zone. Each is held as UTC noon of
+// that date and formatted in UTC, so the browser's own zone never shifts it.
+function dayKey(date: Date, timeZone = "UTC") {
+  return date.toLocaleDateString("en-CA", { timeZone }) // YYYY-MM-DD
 }
 
 function dayLabel(date: Date, index: number) {
   const md = date.toLocaleDateString(undefined, {
     month: "long",
     day: "numeric",
+    timeZone: "UTC",
   })
   const name =
     index === 0
       ? "Today"
       : index === 1
         ? "Tomorrow"
-        : date.toLocaleDateString(undefined, { weekday: "long" })
+        : date.toLocaleDateString(undefined, {
+            weekday: "long",
+            timeZone: "UTC",
+          })
   return `${name} · ${md}`
 }
 
@@ -53,11 +52,12 @@ export default function CalendarPage() {
   const events = useEvents(DAYS)
   const connect = useConnectGoogle()
   const [selected, setSelected] = useState(0)
+  const timeZone = useTimezone()
 
-  const today = startOfToday()
+  const today = new Date(`${dayKey(new Date(), timeZone)}T12:00:00Z`)
   const days = Array.from({ length: DAYS }, (_, i) => {
     const d = new Date(today)
-    d.setDate(today.getDate() + i)
+    d.setUTCDate(today.getUTCDate() + i)
     return d
   })
 
@@ -65,7 +65,7 @@ export default function CalendarPage() {
   for (const event of events.data ?? []) {
     const key = event.all_day
       ? event.start.slice(0, 10)
-      : dayKey(new Date(event.start))
+      : dayKey(new Date(event.start), timeZone)
     byDay.set(key, [...(byDay.get(key) ?? []), event])
   }
   const groups = days
@@ -75,7 +75,8 @@ export default function CalendarPage() {
     e.todos.map((todo) => ({ todo, event: e })),
   )
 
-  const notConnected = google.data && !google.data.connected
+  // Reminders stay off unless the server confirms a connection.
+  const connected = google.data?.connected === true
 
   return (
     <>
@@ -86,7 +87,7 @@ export default function CalendarPage() {
         action={
           <ReminderDialog
             trigger={
-              <Button size="lg" disabled={notConnected}>
+              <Button size="lg" disabled={!connected}>
                 <CalendarPlus aria-hidden /> Create reminder
               </Button>
             }
@@ -98,7 +99,7 @@ export default function CalendarPage() {
               <button
                 type="button"
                 aria-label="Create reminder"
-                disabled={notConnected}
+                disabled={!connected}
                 className={mobileActionClass}
               >
                 <Plus aria-hidden />
@@ -109,7 +110,7 @@ export default function CalendarPage() {
       />
 
       <div className="flex flex-col gap-4 p-4 md:gap-5 md:px-11 md:pt-6 md:pb-9">
-        {google.data?.connected && (
+        {connected && (
           <Link
             href="/settings"
             className="bg-blue-soft flex min-h-12 items-center gap-3 rounded-[10px] px-4 text-[13px] font-medium text-[#41609a] md:hidden"
@@ -150,16 +151,20 @@ export default function CalendarPage() {
                       <span className="md:hidden">
                         {date.toLocaleDateString(undefined, {
                           weekday: "short",
+                          timeZone: "UTC",
                         })}
                       </span>
                       <span className="hidden md:inline">Today</span>
                     </>
                   ) : (
-                    date.toLocaleDateString(undefined, { weekday: "short" })
+                    date.toLocaleDateString(undefined, {
+                      weekday: "short",
+                      timeZone: "UTC",
+                    })
                   )}
                 </span>
                 <span className="text-lg leading-none font-semibold md:font-normal">
-                  {date.getDate()}
+                  {date.getUTCDate()}
                 </span>
               </button>
             )
@@ -170,7 +175,12 @@ export default function CalendarPage() {
           <div className="min-w-0 space-y-5">
             {google.isPending || events.isPending ? (
               <LoadingRows count={4} />
-            ) : notConnected ? (
+            ) : google.isError ? (
+              <ErrorState
+                error={google.error}
+                onRetry={() => google.refetch()}
+              />
+            ) : !connected ? (
               <EmptyState icon={CalendarDays} title="Connect Google Calendar">
                 <p>
                   Homie reads your upcoming events live and adds reminders you
@@ -226,7 +236,7 @@ export default function CalendarPage() {
           </div>
 
           <aside className="hidden flex-col gap-4 pt-7 md:flex">
-            {google.data?.connected && (
+            {connected && (
               <section className="bg-card rounded-xl border p-5">
                 <div className="flex items-center gap-3">
                   <span className="bg-blue-soft grid size-10 place-items-center rounded-[9px] text-[#41609a]">
