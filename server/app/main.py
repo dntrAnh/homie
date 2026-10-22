@@ -14,7 +14,7 @@ from starlette.requests import Request
 from app.config import settings
 from app.mcp_server import mcp, mcp_app
 from app.middleware.auth import McpAuthGate, RateLimiter
-from app.routes import health, me, memories
+from app.routes import health, me, memories, simulator
 from app.services.memory_service import (
     AccountDeletingError,
     IdempotencyConflictError,
@@ -38,6 +38,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Homie API", lifespan=lifespan)
 app.state.api_rate_limiter = RateLimiter(max_requests=120)
 app.state.mcp_rate_limiter = RateLimiter(max_requests=60)
+app.state.simulator_minute_rate_limiter = RateLimiter(
+    max_requests=10,
+    detail="Simulator minute limit reached. Please try again shortly.",
+)
+app.state.simulator_daily_rate_limiter = RateLimiter(
+    max_requests=200,
+    window_seconds=86400,
+    detail="Simulator rolling 24-hour limit reached. Please try again later.",
+)
 
 
 @app.exception_handler(MemoryNotFoundError)
@@ -125,6 +134,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(memories.router)
 app.include_router(me.router)
+app.include_router(simulator.router)
 app.add_route("/mcp", mcp_app, methods=["GET", "POST", "DELETE"])
 
 
