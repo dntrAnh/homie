@@ -101,10 +101,6 @@ export function StoredMemories() {
                     {m.event_id && (
                       <Detail label="Event_id" value={m.event_id} />
                     )}
-                    <Detail
-                      label="Attached media"
-                      value={m.media_ids.length || "—"}
-                    />
                     <Detail label="Created" value={date(m.created_at)} />
                     <Detail label="Updated" value={date(m.updated_at)} />
                   </dl>

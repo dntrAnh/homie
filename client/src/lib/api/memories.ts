@@ -14,6 +14,7 @@ export type Memory = {
   content: string
   tags: string[]
   event_id?: string | null
+  /** Filled only by GET /api/memories/{id}; list and mutation responses return []. */
   media_ids: string[]
   created_at: string
   updated_at: string
