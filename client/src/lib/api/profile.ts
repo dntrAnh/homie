@@ -13,11 +13,11 @@ export type Profile = {
   travel_mode: TravelMode
 }
 
-/** Omitted fields keep their saved value; `home: null` clears it. */
+/** Omitted fields keep their saved value; `home_address: ""` clears home. */
 export type ProfileUpdate = {
   timezone?: string
   travel_mode?: TravelMode
-  home?: { address: string } | null
+  home_address?: string
 }
 
 export function useProfile() {

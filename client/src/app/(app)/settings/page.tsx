@@ -104,7 +104,7 @@ function SettingsForm({ profile }: { profile: Profile }) {
       {
         timezone,
         travel_mode: mode,
-        home: home.trim() ? { address: home.trim() } : null,
+        home_address: home.trim(),
       },
       {
         onSuccess: () => toast.success("Settings saved"),
