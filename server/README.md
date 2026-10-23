@@ -97,6 +97,11 @@ value calculated from the oldest request still occupying that window.
 
 For local manual use, configure Cognito, `PUBLIC_BASE_URL`, and the desired
 provider settings in `server/.env`, then run `uv run fastapi dev app/main.py`.
+`PUBLIC_BASE_URL` must be a URL the server can reach *itself* at, since the
+simulator uses it to open a self-connection to this server's own `/mcp`
+endpoint: use `http://localhost:8000` (or `http://server:8000` in the compose
+stack), never a public tunnel hostname, which may be dead or unreachable from
+inside the server process.
 Automated simulator tests need no live model or external MCP process: they use
 scripted provider responses, the in-process `/mcp` ASGI transport, and Moto
 DynamoDB. Run them with `uv run pytest tests/test_simulator.py`.
