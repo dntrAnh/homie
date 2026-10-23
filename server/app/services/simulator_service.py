@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -18,13 +19,30 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp_types import CallToolResult, Tool
+from pydantic import ValidationError
 
 from app.config import settings
-from app.models.simulator import ChatMessage, ChatReply
+from app.models.memory import ChangeResult, RecallResult
+from app.models.simulator import (
+    ChangeToolCall,
+    ChatMessage,
+    ChatReply,
+    RecallToolCall,
+    ToolCall,
+    ToolErrorResult,
+)
 
 BEDROCK_MAX_OUTPUT_TOKENS = 512
 MCP_TIMEOUT_SECONDS = 8.0
+REQUEST_TIMEOUT_SECONDS = 60.0
+MAX_BEDROCK_ROUNDS = 3
+MAX_TOOL_CALLS = 4
+MAX_TOOL_ARGUMENT_BYTES = 4096
 EXPECTED_MCP_TOOLS = frozenset({"remember", "recall", "forget"})
+PARTIAL_REPLY = (
+    "The simulator completed the tool calls shown, but could not finish its reply. "
+    "Review the results before trying again."
+)
 SYSTEM_PROMPT = (
     "Use only the supplied memory tools. Never claim an action succeeded unless its tool "
     "result confirms success. Explain tool failures plainly."
@@ -55,6 +73,13 @@ class BedrockRuntimeClient(Protocol):
 class BedrockTurn:
     message: dict[str, Any]
     stop_reason: Literal["end_turn", "tool_use"]
+
+
+@dataclass(frozen=True)
+class RequestedTool:
+    tool_use_id: str
+    name: str
+    arguments: dict[str, Any]
 
 
 @cache
@@ -206,6 +231,197 @@ async def connect_mcp(
         raise UpstreamUnavailableError from exc
 
 
-async def run_chat(messages: list[ChatMessage], access_token: str) -> ChatReply:
-    """Run the simulator conversation once Milestone 5 wires the boundaries together."""
+def _final_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise InvalidModelOutputError
+    texts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or set(block) != {"text"}:
+            raise InvalidModelOutputError
+        text = block["text"]
+        if not isinstance(text, str):
+            raise InvalidModelOutputError
+        if text.strip():
+            texts.append(text.strip())
+    if not texts:
+        raise InvalidModelOutputError
+    return "\n".join(texts)
+
+
+def _tool_requests(
+    message: dict[str, Any],
+    *,
+    seen_tool_use_ids: set[str],
+    completed_calls: int,
+) -> list[RequestedTool]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise InvalidModelOutputError
+
+    requests: list[RequestedTool] = []
+    batch_ids: set[str] = set()
+    for block in content:
+        if not isinstance(block, dict):
+            raise InvalidModelOutputError
+        if set(block) == {"text"}:
+            if not isinstance(block["text"], str):
+                raise InvalidModelOutputError
+            continue
+        if set(block) != {"toolUse"} or not isinstance(block["toolUse"], dict):
+            raise InvalidModelOutputError
+
+        tool_use = block["toolUse"]
+        tool_use_id = tool_use.get("toolUseId")
+        name = tool_use.get("name")
+        arguments = tool_use.get("input")
+        if (
+            not isinstance(tool_use_id, str)
+            or not tool_use_id.strip()
+            or tool_use_id in seen_tool_use_ids
+            or tool_use_id in batch_ids
+            or not isinstance(name, str)
+            or name not in EXPECTED_MCP_TOOLS
+            or not isinstance(arguments, dict)
+            or not all(isinstance(key, str) for key in arguments)
+        ):
+            raise InvalidModelOutputError
+        try:
+            serialized = json.dumps(
+                arguments,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise InvalidModelOutputError from exc
+        if len(serialized) > MAX_TOOL_ARGUMENT_BYTES:
+            raise InvalidModelOutputError
+
+        batch_ids.add(tool_use_id)
+        requests.append(
+            RequestedTool(
+                tool_use_id=tool_use_id,
+                name=name,
+                arguments=arguments,
+            )
+        )
+
+    if not requests or completed_calls + len(requests) > MAX_TOOL_CALLS:
+        raise InvalidModelOutputError
+    seen_tool_use_ids.update(batch_ids)
+    return requests
+
+
+def _mcp_result_payload(result: CallToolResult) -> dict[str, Any]:
+    if result.result_type != "complete":
+        raise UpstreamUnavailableError
+    if result.is_error:
+        messages = [
+            part.text.strip()
+            for part in result.content
+            if getattr(part, "type", None) == "text"
+            and isinstance(getattr(part, "text", None), str)
+            and part.text.strip()
+        ]
+        if not messages:
+            raise UpstreamUnavailableError
+        return {"error": " ".join(messages)}
+    if not isinstance(result.structured_content, dict):
+        raise UpstreamUnavailableError
+    try:
+        json.dumps(result.structured_content, ensure_ascii=False, allow_nan=False)
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise UpstreamUnavailableError from exc
+    return result.structured_content
+
+
+def _tool_call(
+    name: str,
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    is_error: bool,
+) -> ToolCall:
+    try:
+        if is_error:
+            result = ToolErrorResult.model_validate(payload)
+            if name == "recall":
+                return RecallToolCall(name=name, arguments=arguments, result=result)
+            if name in {"remember", "forget"}:
+                return ChangeToolCall(name=name, arguments=arguments, result=result)
+        elif name == "recall":
+            result = RecallResult.model_validate(payload)
+            return RecallToolCall(name=name, arguments=arguments, result=result.memories)
+        elif name in {"remember", "forget"}:
+            result = ChangeResult.model_validate(payload)
+            return ChangeToolCall(name=name, arguments=arguments, result=result)
+    except ValidationError as exc:
+        raise UpstreamUnavailableError from exc
     raise UpstreamUnavailableError
+
+
+async def _orchestrate_chat(
+    messages: list[ChatMessage],
+    access_token: str,
+    confirmed_calls: list[ToolCall],
+) -> ChatReply:
+    conversation = bedrock_messages(messages)
+    seen_tool_use_ids: set[str] = set()
+
+    async with connect_mcp(access_token) as mcp:
+        # main loop of client
+        for _ in range(MAX_BEDROCK_ROUNDS):
+            turn = await call_bedrock(conversation, mcp.bedrock_tools)
+            conversation.append(turn.message)
+            if turn.stop_reason == "end_turn":
+                return ChatReply(
+                    reply=_final_text(turn.message),
+                    tool_calls=confirmed_calls,
+                )
+
+            requests = _tool_requests(
+                turn.message,
+                seen_tool_use_ids=seen_tool_use_ids,
+                completed_calls=len(confirmed_calls),
+            )
+            bedrock_results: list[dict[str, Any]] = []
+            for request in requests:
+                result = await mcp.call_tool(request.name, request.arguments)
+                payload = _mcp_result_payload(result)
+                confirmed_calls.append(
+                    _tool_call(
+                        request.name,
+                        request.arguments,
+                        payload,
+                        is_error=result.is_error,
+                    )
+                )
+                bedrock_results.append(
+                    {
+                        "toolResult": {
+                            "toolUseId": request.tool_use_id,
+                            "content": [{"json": payload}],
+                            "status": "error" if result.is_error else "success",
+                        }
+                    }
+                )
+            conversation.append({"role": "user", "content": bedrock_results})
+
+    raise InvalidModelOutputError
+
+
+async def run_chat(messages: list[ChatMessage], access_token: str) -> ChatReply:
+    """Coordinate bounded Bedrock tool use through the authenticated MCP endpoint."""
+    confirmed_calls: list[ToolCall] = []
+    try:
+        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+            return await _orchestrate_chat(messages, access_token, confirmed_calls)
+    except TimeoutError as exc:
+        if confirmed_calls:
+            return ChatReply(reply=PARTIAL_REPLY, tool_calls=confirmed_calls)
+        raise SimulatorTimeoutError from exc
+    except SimulatorServiceError:
+        if confirmed_calls:
+            return ChatReply(reply=PARTIAL_REPLY, tool_calls=confirmed_calls)
+        raise
