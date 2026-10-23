@@ -38,8 +38,8 @@ def _log_simulator_failure(error_type: str, status_code: int) -> None:
         422: {"description": "Invalid request fields"},
         429: {"description": "Simulator rate limit reached"},
         502: {"description": "Invalid model response"},
-        503: {"description": "Bedrock or MCP unavailable"},
-        504: {"description": "Bedrock, MCP, or request timeout"},
+        503: {"description": "Model provider or MCP unavailable"},
+        504: {"description": "Model provider, MCP, or request timeout"},
     },
 )
 async def chat(data: ChatRequest, request: Request, user: CurrentUserDependency) -> ChatReply:
