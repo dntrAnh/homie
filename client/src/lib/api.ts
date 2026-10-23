@@ -11,6 +11,7 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    public retryAfter?: number,
   ) {
     super(message)
     this.name = "ApiError"
@@ -64,7 +65,16 @@ export function useApi() {
         auth.invalidateSession(token)
         window.dispatchEvent(new Event("homie:session-expired"))
       }
-      if (!res.ok) throw new ApiError(res.status, messageFor(res.status))
+      if (!res.ok) {
+        const retryAfter = Number(res.headers.get("Retry-After"))
+        throw new ApiError(
+          res.status,
+          messageFor(res.status),
+          Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter
+            : undefined,
+        )
+      }
       return (res.status === 204 ? undefined : await res.json()) as T
     },
     [auth, token],

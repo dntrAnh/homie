@@ -21,8 +21,10 @@ import { useApi } from "@/lib/api"
 import { useMemories } from "@/lib/api/memories"
 import {
   type ChatMessage,
+  mutatedMemories,
   recalled,
   type ToolCall,
+  toolError,
   useSimulatorChat,
 } from "@/lib/api/simulator"
 import { useAuth } from "@/lib/auth"
@@ -42,8 +44,10 @@ function Avatar() {
 }
 
 function AssistantTurn({ turn }: { turn: Turn }) {
-  const memories = recalled(turn.tools ?? [])
-  const others = (turn.tools ?? []).filter((t) => t.name !== "recall")
+  const calls = turn.tools ?? []
+  const memories = recalled(calls)
+  const recallCalls = calls.filter((call) => call.name === "recall")
+  const changes = calls.filter((call) => call.name !== "recall")
   return (
     <li className="flex items-start gap-3">
       <Avatar />
@@ -94,14 +98,48 @@ function AssistantTurn({ turn }: { turn: Turn }) {
             </span>
           </>
         )}
-        {others.map((t, i) => (
-          <span
-            key={i}
-            className="bg-muted text-muted-foreground mt-3 mr-2 inline-flex h-7 items-center rounded-full px-2.5 font-mono text-[11px]"
-          >
-            {t.name}
-          </span>
-        ))}
+        {recallCalls.map((call, i) => {
+          const error = toolError(call)
+          const label = error
+            ? `Recall failed: ${error}`
+            : Array.isArray(call.result) && call.result.length === 0
+              ? "No memories found"
+              : null
+          return label ? (
+            <span
+              key={`recall-${i}`}
+              className={cn(
+                "mt-3 mr-2 inline-flex min-h-7 items-center rounded-full px-2.5 text-[11px]",
+                error
+                  ? "bg-destructive/10 text-destructive"
+                  : "bg-muted text-muted-foreground",
+              )}
+            >
+              {label}
+            </span>
+          ) : null
+        })}
+        {changes.map((call, i) => {
+          const error = toolError(call)
+          const label = error
+            ? `${call.name === "remember" ? "Save" : "Delete"} failed: ${error}`
+            : call.name === "remember"
+              ? "Memory saved"
+              : "Memory deleted"
+          return (
+            <span
+              key={`${call.name}-${i}`}
+              className={cn(
+                "mt-3 mr-2 inline-flex min-h-7 items-center rounded-full px-2.5 text-[11px]",
+                error
+                  ? "bg-destructive/10 text-destructive"
+                  : "bg-muted text-muted-foreground",
+              )}
+            >
+              {label}
+            </span>
+          )
+        })}
       </div>
     </li>
   )
@@ -115,6 +153,7 @@ export default function SimulatorPage() {
   const memories = useMemories()
   const [turns, setTurns] = useState<Turn[]>([])
   const [draft, setDraft] = useState("")
+  const [limitError, setLimitError] = useState<string | null>(null)
   const end = useRef<HTMLLIElement>(null)
 
   const firstName = session?.user.name.split(" ")[0]
@@ -132,6 +171,19 @@ export default function SimulatorPage() {
     const text = draft.trim()
     if (!text || chat.isPending) return
     const next: Turn[] = [...turns, { role: "user", content: text }]
+    const transcriptLength = next.reduce(
+      (total, turn) => total + turn.content.length,
+      0,
+    )
+    // A valid alternating transcript that starts and ends with the user has
+    // at most 19 messages, even though the API's generic list cap is 20.
+    if (next.length > 19 || transcriptLength > 12000) {
+      setLimitError(
+        "This conversation has reached its limit. Start a new conversation to continue.",
+      )
+      return
+    }
+    setLimitError(null)
     setTurns(next)
     chat.mutate(
       next.map(({ role, content }) => ({ role, content })),
@@ -142,7 +194,7 @@ export default function SimulatorPage() {
             ...next,
             { role: "assistant", content: reply, tools: tool_calls },
           ])
-          if (tool_calls.length) {
+          if (mutatedMemories(tool_calls)) {
             void qc.invalidateQueries({ queryKey: [sub, "memories"] })
           }
         },
@@ -156,6 +208,7 @@ export default function SimulatorPage() {
     chat.reset()
     setTurns([])
     setDraft("")
+    setLimitError(null)
   }
 
   return (
@@ -233,9 +286,9 @@ export default function SimulatorPage() {
                 </span>
               </li>
             )}
-            {chat.isError && (
+            {(chat.isError || limitError) && (
               <li role="alert" className="text-destructive pl-11 text-sm">
-                {chat.error.message}
+                {limitError ?? (chat.isError ? chat.error.message : null)}
               </li>
             )}
             <li ref={end} aria-hidden />
@@ -272,7 +325,10 @@ export default function SimulatorPage() {
               placeholder="Ask Alexa to remember or recall…"
               value={draft}
               maxLength={2000}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => {
+                setDraft(e.target.value)
+                setLimitError(null)
+              }}
               className="bg-muted md:bg-muted"
             />
             <Button
