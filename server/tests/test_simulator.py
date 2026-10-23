@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from app import main
 from app.config import Settings
 from app.middleware.auth import RateLimiter
-from app.models.simulator import ChatReply, ChatRequest, RecallToolCall
+from app.models.simulator import ChatMessage, ChatReply, ChatRequest, RecallToolCall
 from app.routes import simulator as simulator_route
 from app.services import memory_service, simulator_service
 from app.services.simulator_service import (
@@ -522,7 +522,14 @@ def test_bedrock_client_uses_bounded_adaptive_configuration(
     assert config.retries == {"total_max_attempts": 3, "mode": "adaptive"}
 
 
-def test_bedrock_boundary_builds_bounded_converse_request_in_worker_thread() -> None:
+def test_bedrock_boundary_builds_bounded_converse_request_in_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        simulator_service.settings,
+        "bedrock_model_id",
+        "us.anthropic.claude-sonnet-5-5",
+    )
     caller_thread = get_ident()
 
     class FakeBedrock:
@@ -565,6 +572,82 @@ def test_bedrock_boundary_builds_bounded_converse_request_in_worker_thread() -> 
         "inferenceConfig": {"maxTokens": BEDROCK_MAX_OUTPUT_TOKENS},
         "toolConfig": {"tools": tools},
     }
+
+
+def test_bedrock_boundary_disables_reasoning_for_kimi_k3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeBedrock:
+        def converse(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {
+                "stopReason": "end_turn",
+                "output": {"message": {"role": "assistant", "content": [{"text": "Done."}]}},
+            }
+
+    monkeypatch.setattr(
+        simulator_service.settings,
+        "bedrock_model_id",
+        "us.moonshotai.kimi-k3",
+    )
+
+    asyncio.run(call_bedrock([], [], client=FakeBedrock()))
+
+    assert captured["modelId"] == "us.moonshotai.kimi-k3"
+    assert captured["additionalModelRequestFields"] == {"reasoning_effort": "none"}
+
+
+def test_bedrock_boundary_removes_kimi_reasoning_blocks_before_tool_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeBedrock:
+        def converse(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "stopReason": "tool_use",
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"reasoningContent": {"reasoningText": {"text": "private"}}},
+                            {"text": "I'll save that."},
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "remember",
+                                    "input": {"content": "Keys are in the drawer"},
+                                }
+                            },
+                        ],
+                    }
+                },
+            }
+
+    monkeypatch.setattr(
+        simulator_service.settings,
+        "bedrock_model_id",
+        "us.moonshotai.kimi-k3",
+    )
+
+    turn = asyncio.run(call_bedrock([], [], client=FakeBedrock()))
+
+    assert turn == BedrockTurn(
+        message={
+            "role": "assistant",
+            "content": [
+                {"text": "I'll save that."},
+                {
+                    "toolUse": {
+                        "toolUseId": "call-1",
+                        "name": "remember",
+                        "input": {"content": "Keys are in the drawer"},
+                    }
+                },
+            ],
+        },
+        stop_reason="tool_use",
+    )
 
 
 def test_bedrock_boundary_accepts_tool_use_envelope() -> None:
@@ -839,6 +922,20 @@ def test_run_chat_returns_text_without_tool_calls(monkeypatch: pytest.MonkeyPatc
     assert reply == ChatReply(reply="Ready.", tool_calls=[])
     assert mcp.calls == []
     assert conversations == [bedrock_messages(request.messages)]
+
+
+def test_run_chat_unwraps_a_single_typed_task_group_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_orchestrate(
+        messages: list[ChatMessage], access_token: str, confirmed_calls: list[Any]
+    ) -> ChatReply:
+        raise ExceptionGroup("unhandled errors in a TaskGroup", [InvalidModelOutputError()])
+
+    monkeypatch.setattr(simulator_service, "_orchestrate_chat", fake_orchestrate)
+
+    with pytest.raises(InvalidModelOutputError):
+        asyncio.run(run_chat([ChatMessage(role="user", content="Hello")], "exact-token"))
 
 
 def test_run_chat_executes_multiple_tool_rounds_and_preserves_results(
