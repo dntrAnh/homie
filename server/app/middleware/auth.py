@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections import OrderedDict, deque
+from math import ceil
 from threading import Lock
 from time import monotonic
 from typing import Annotated, Any
@@ -149,11 +150,13 @@ class RateLimiter:
         window_seconds: float = 60.0,
         max_entries: int = 10000,
         cleanup_interval: float = 10.0,
+        detail: str = "Too many requests. Please try again in a minute.",
     ) -> None:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.max_entries = max_entries
         self.cleanup_interval = cleanup_interval
+        self.detail = detail
         self.requests: OrderedDict[str, deque[float]] = OrderedDict()
         self.last_cleanup = 0.0
         self.lock = Lock()
@@ -185,10 +188,11 @@ class RateLimiter:
                 timestamps.popleft()
 
             if len(timestamps) >= self.max_requests:
+                retry_after = max(1, ceil(self.window_seconds - (now - timestamps[0])))
                 raise HTTPException(
                     429,
-                    "Too many requests. Please try again in a minute.",
-                    headers={"Retry-After": "60"},
+                    self.detail,
+                    headers={"Retry-After": str(retry_after)},
                 )
 
             timestamps.append(now)
@@ -208,6 +212,11 @@ def current_user(request: Request) -> CurrentUser:
 
 
 CurrentUserDependency = Annotated[CurrentUser, Depends(current_user)]
+
+
+def bearer_token(request: Request) -> str:
+    """Return the bearer token after a route's auth dependency has succeeded."""
+    return _bearer_token(request)
 
 
 class McpAuthGate:

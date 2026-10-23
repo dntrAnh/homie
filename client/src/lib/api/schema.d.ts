@@ -58,16 +58,128 @@ export interface paths {
     patch: operations["update_memory_api_memories__memory_id__patch"]
     trace?: never
   }
+  "/api/me/profile": {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    /** Get Profile */
+    get: operations["get_profile_api_me_profile_get"]
+    /** Put Profile */
+    put: operations["put_profile_api_me_profile_put"]
+    post?: never
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
+  "/api/me": {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    get?: never
+    put?: never
+    post?: never
+    /** Delete Me */
+    delete: operations["delete_me_api_me_delete"]
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
+  "/api/simulator/chat": {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    get?: never
+    put?: never
+    /** Chat */
+    post: operations["chat_api_simulator_chat_post"]
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
 }
 export type webhooks = Record<string, never>
 export interface components {
   schemas: {
+    /** ChangeResult */
+    ChangeResult: {
+      /**
+       * Status
+       * @constant
+       */
+      status: "success"
+      /** Memory Id */
+      memory_id: string
+    }
+    /** ChangeToolCall */
+    ChangeToolCall: {
+      /**
+       * @description discriminator enum property added by openapi-typescript
+       * @enum {string}
+       */
+      name: "forget" | "remember"
+      /** Arguments */
+      arguments: {
+        [key: string]: unknown
+      }
+      /** Result */
+      result:
+        | components["schemas"]["ChangeResult"]
+        | components["schemas"]["ToolErrorResult"]
+    }
+    /** ChatMessage */
+    ChatMessage: {
+      /**
+       * Role
+       * @enum {string}
+       */
+      role: "user" | "assistant"
+      /** Content */
+      content: string
+    }
+    /** ChatReply */
+    ChatReply: {
+      /** Reply */
+      reply: string
+      /** Tool Calls */
+      tool_calls: (
+        | components["schemas"]["ChangeToolCall"]
+        | components["schemas"]["RecallToolCall"]
+      )[]
+    }
+    /** ChatRequest */
+    ChatRequest: {
+      /** Messages */
+      messages: components["schemas"]["ChatMessage"][]
+    }
     /** HTTPValidationError */
     HTTPValidationError: {
       /** Detail */
       detail: string
       /** Errors */
       errors: components["schemas"]["ValidationError"][]
+    }
+    /** Home */
+    Home: {
+      /** Address */
+      address: string
+      /** Lat */
+      lat?: number | null
+      /** Lng */
+      lng?: number | null
     }
     /** Memory */
     Memory: {
@@ -131,6 +243,71 @@ export interface components {
       tags?: string[] | null
       /** Event Id */
       event_id?: string | null
+    }
+    /** Profile */
+    Profile: {
+      /**
+       * Timezone
+       * @default UTC
+       */
+      timezone: string
+      home?: components["schemas"]["Home"] | null
+      /**
+       * Travel Mode
+       * @default DRIVE
+       * @enum {string}
+       */
+      travel_mode: "DRIVE" | "WALK" | "BICYCLE" | "TRANSIT"
+    }
+    /**
+     * ProfileUpdate
+     * @description Omitted fields keep their stored value. Clients send only the home address (the
+     *     server owns the coordinates); an empty `home_address` clears home.
+     */
+    ProfileUpdate: {
+      /** Timezone */
+      timezone?: string | null
+      /** Home Address */
+      home_address?: string | null
+      /** Travel Mode */
+      travel_mode?: ("DRIVE" | "WALK" | "BICYCLE" | "TRANSIT") | null
+    }
+    /** RecallToolCall */
+    RecallToolCall: {
+      /**
+       * @description discriminator enum property added by openapi-typescript
+       * @enum {string}
+       */
+      name: "recall"
+      /** Arguments */
+      arguments: {
+        [key: string]: unknown
+      }
+      /** Result */
+      result:
+        | components["schemas"]["RecalledMemory"][]
+        | components["schemas"]["ToolErrorResult"]
+    }
+    /** RecalledMemory */
+    RecalledMemory: {
+      /** Id */
+      id: string
+      /** Content */
+      content: string
+      /**
+       * Kind
+       * @enum {string}
+       */
+      kind: "item_location" | "fact" | "preference" | "todo"
+      /** Tags */
+      tags: string[]
+      /** Created At */
+      created_at: string
+    }
+    /** ToolErrorResult */
+    ToolErrorResult: {
+      /** Error */
+      error: string
     }
     /** ValidationError */
     ValidationError: {
@@ -346,6 +523,143 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["HTTPValidationError"]
         }
+      }
+    }
+  }
+  get_profile_api_me_profile_get: {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    requestBody?: never
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["Profile"]
+        }
+      }
+    }
+  }
+  put_profile_api_me_profile_put: {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ProfileUpdate"]
+      }
+    }
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["Profile"]
+        }
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"]
+        }
+      }
+    }
+  }
+  delete_me_api_me_delete: {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    requestBody?: never
+    responses: {
+      /** @description Successful Response */
+      204: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+    }
+  }
+  chat_api_simulator_chat_post: {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ChatRequest"]
+      }
+    }
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["ChatReply"]
+        }
+      }
+      /** @description Invalid or missing authentication token */
+      401: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+      /** @description Invalid request fields */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+      /** @description Simulator rate limit reached */
+      429: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+      /** @description Invalid model response */
+      502: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+      /** @description Bedrock or MCP unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+      /** @description Bedrock, MCP, or request timeout */
+      504: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
       }
     }
   }
