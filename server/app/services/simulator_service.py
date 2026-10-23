@@ -39,6 +39,14 @@ MAX_BEDROCK_ROUNDS = 3
 MAX_TOOL_CALLS = 4
 MAX_TOOL_ARGUMENT_BYTES = 4096
 EXPECTED_MCP_TOOLS = frozenset({"remember", "recall", "forget"})
+KIMI_K3_MODEL_IDS = frozenset(
+    {
+        "moonshotai.kimi-k3",
+        "us.moonshotai.kimi-k3",
+        "in.moonshotai.kimi-k3",
+        "global.moonshotai.kimi-k3",
+    }
+)
 PARTIAL_REPLY = (
     "The simulator completed the tool calls shown, but could not finish its reply. "
     "Review the results before trying again."
@@ -124,8 +132,16 @@ def _validate_bedrock_response(response: object) -> BedrockTurn:
             raise InvalidModelOutputError
     else:
         raise InvalidModelOutputError
+
+    # Kimi K3's Converse integration can emit reasoning blocks even when reasoning
+    # effort is disabled. Bedrock documents that those blocks must be removed before
+    # sending a later Converse turn for Kimi K3, so retain only the usable response
+    # blocks for this application's tool loop.
+    if settings.bedrock_model_id in KIMI_K3_MODEL_IDS:
+        content = [block for block in content if set(block) != {"reasoningContent"}]
+
     return BedrockTurn(
-        message=cast(dict[str, Any], message),
+        message={**message, "content": content},
         stop_reason=cast(Literal["end_turn", "tool_use"], stop_reason),
     )
 
@@ -138,13 +154,20 @@ async def call_bedrock(
 ) -> BedrockTurn:
     try:
         runtime_client = client or get_bedrock_client()
+        request: dict[str, Any] = {
+            "modelId": settings.bedrock_model_id,
+            "messages": messages,
+            "system": [{"text": SYSTEM_PROMPT}],
+            "inferenceConfig": {"maxTokens": BEDROCK_MAX_OUTPUT_TOKENS},
+            "toolConfig": {"tools": tools},
+        }
+        if settings.bedrock_model_id in KIMI_K3_MODEL_IDS:
+            # Kimi reasons at maximum effort by default, while its Converse API has
+            # known multi-turn limitations when reasoning blocks are sent back.
+            request["additionalModelRequestFields"] = {"reasoning_effort": "none"}
         response = await asyncio.to_thread(
             runtime_client.converse,
-            modelId=settings.bedrock_model_id,
-            messages=messages,
-            system=[{"text": SYSTEM_PROMPT}],
-            inferenceConfig={"maxTokens": BEDROCK_MAX_OUTPUT_TOKENS},
-            toolConfig={"tools": tools},
+            **request,
         )
     except (ConnectTimeoutError, ReadTimeoutError) as exc:
         raise SimulatorTimeoutError from exc
@@ -425,3 +448,17 @@ async def run_chat(messages: list[ChatMessage], access_token: str) -> ChatReply:
         if confirmed_calls:
             return ChatReply(reply=PARTIAL_REPLY, tool_calls=confirmed_calls)
         raise
+    except BaseExceptionGroup as exc:
+        leaves: list[BaseException] = []
+        pending = list(exc.exceptions)
+        while pending:
+            current = pending.pop()
+            if isinstance(current, BaseExceptionGroup):
+                pending.extend(current.exceptions)
+            else:
+                leaves.append(current)
+        if len(leaves) != 1 or not isinstance(leaves[0], SimulatorServiceError):
+            raise
+        if confirmed_calls:
+            return ChatReply(reply=PARTIAL_REPLY, tool_calls=confirmed_calls)
+        raise leaves[0] from exc
