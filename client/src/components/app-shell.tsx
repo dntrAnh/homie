@@ -1,20 +1,39 @@
 "use client"
 
-import { Brain, HouseHeart, LogOut, Settings } from "lucide-react"
+import {
+  Brain,
+  CalendarDays,
+  HouseHeart,
+  Images,
+  LogOut,
+  MessageCircle,
+  Settings,
+  WifiOff,
+} from "lucide-react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { toast } from "sonner"
 
 import { initials, useAuth } from "@/lib/auth"
+import { useOnline } from "@/lib/pwa"
 import { cn } from "@/lib/utils"
 
 const NAV = [
   { href: "/memories", label: "Memories", short: "Memories", icon: Brain },
+  {
+    href: "/calendar",
+    label: "Calendar",
+    short: "Calendar",
+    icon: CalendarDays,
+  },
+  { href: "/media", label: "Media", short: "Media", icon: Images },
+  { href: "/simulator", label: "Simulator", short: "Sim", icon: MessageCircle },
   { href: "/settings", label: "Settings", short: "Settings", icon: Settings },
 ]
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
+  const online = useOnline()
   const { session, signOut } = useAuth()
   const user = session?.user
   const handleSignOut = () => {
@@ -93,6 +112,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col pb-[calc(4rem+env(safe-area-inset-bottom))] md:pb-0">
+        {!online && (
+          <p
+            role="status"
+            className="bg-sidebar sticky top-0 z-30 flex items-center gap-2 px-4 py-2.5 pt-[max(0.625rem,env(safe-area-inset-top))] text-[13px] text-white md:px-11"
+          >
+            <WifiOff className="size-4 shrink-0" aria-hidden />
+            You&apos;re offline. What you see may be out of date, and changes
+            need a connection.
+          </p>
+        )}
         {children}
       </main>
 

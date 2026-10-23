@@ -1,46 +1,52 @@
 "use client"
 
+import { ShieldCheck } from "lucide-react"
 import { useRouter } from "next/navigation"
 import { useEffect } from "react"
 
+import { AuthCard, AuthLayout } from "@/components/auth/auth-layout"
 import { Button } from "@/components/ui/button"
 import { useAuth } from "@/lib/auth"
 
-export default function Home() {
-  const auth = useAuth()
+export default function Welcome() {
+  const { loading, session, error, signIn } = useAuth()
   const router = useRouter()
 
   useEffect(() => {
-    if (auth.session) router.replace("/memories")
-  }, [auth.session, router])
+    if (session) router.replace("/memories")
+  }, [session, router])
 
   return (
-    <main className="bg-welcome flex min-h-dvh flex-col items-center justify-center gap-6 p-6 text-center">
-      <div className="bg-primary/10 text-primary grid size-16 place-items-center rounded-2xl text-3xl font-bold">
-        h
-      </div>
-      <div className="space-y-3">
-        <h1 className="font-heading text-4xl font-bold tracking-tight">
-          homie
-        </h1>
-        <p className="text-muted-foreground max-w-md text-balance">
-          Remember the little things. Homie keeps track of where things are,
-          what you like, and what is coming up.
+    <AuthLayout>
+      <AuthCard>
+        <h2 className="font-heading text-2xl font-medium md:text-[32px]">
+          Welcome home
+        </h2>
+        <p className="text-muted-foreground mt-3 text-sm md:mt-5 md:text-[15px]">
+          Sign in to see and manage everything Homie remembers for you.
         </p>
-      </div>
-      {auth.error && (
-        <p role="alert" className="text-destructive text-sm">
-          {auth.error}
+        {/* Cognito's Hosted UI handles both sign-in and sign-up (plan Task 9). */}
+        <Button
+          size="lg"
+          disabled={loading}
+          onClick={signIn}
+          className="mt-5 h-12 w-full text-[15px] md:mt-6"
+        >
+          Continue
+        </Button>
+        <p className="text-muted-foreground mt-3 text-center text-xs">
+          New to Homie? You can create an account on the next screen.
         </p>
-      )}
-      <Button
-        size="lg"
-        className="min-h-11 min-w-40"
-        disabled={auth.loading}
-        onClick={() => void auth.signIn()}
-      >
-        {auth.loading ? "Loading…" : "Sign in"}
-      </Button>
-    </main>
+        {error && (
+          <p role="alert" className="text-destructive mt-3 text-sm">
+            {error}
+          </p>
+        )}
+        <p className="text-muted-foreground mt-5 hidden items-center gap-2 border-t pt-5 text-xs md:flex">
+          <ShieldCheck className="text-accent-dark size-4" aria-hidden />
+          Your memories stay private and can be edited or deleted anytime.
+        </p>
+      </AuthCard>
+    </AuthLayout>
   )
 }

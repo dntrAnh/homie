@@ -30,6 +30,31 @@ Use Chrome as the primary browser on the team's available phones. Exact device, 
 7. Trigger or simulate an API 401 and confirm the session-expired notice offers reauthentication.
 8. Sign out and verify Cognito returns the browser to the allowed frontend origin.
 
+## PWA: offline fallback and cache boundaries
+
+Results from Plan 1 Task 9a (issue #18). Record actual results, not assumed passes.
+
+Production build (`bun run build && bunx next start`), desktop Chrome via Playwright, 2026-10-18:
+
+| Check                                                                                         | Result  |
+| --------------------------------------------------------------------------------------------- | ------- |
+| `/manifest.webmanifest` served with `id: "/"`, standalone, 192/512 + maskable icons           | ✅ pass |
+| `/sw.js` served as JavaScript with `Cache-Control: no-cache, no-store, must-revalidate`       | ✅ pass |
+| Worker controls the page after one load                                                       | ✅ pass |
+| Cache Storage holds only `homie-public-v1`: `/offline.html`, `/icons/icon-192.png`            | ✅ pass |
+| Offline navigation to `/memories` shows only the generic fallback (logo loads)                | ✅ pass |
+| Offline `/auth/callback?code=…` is not intercepted (browser network error, no state consumed) | ✅ pass |
+| Online 404 is returned as-is, not replaced by the fallback                                    | ✅ pass |
+
+## PWA: still to run (needs hosted HTTPS origin + real devices)
+
+- [ ] Install + cold launch on iOS (Safari) and Android (Chrome); icons and splash look right
+- [ ] Settings install help: install button on Chrome/Android, Add to Home Screen steps on iOS, hidden when installed, "Not now" sticks
+- [ ] Offline banner appears/disappears in the app shell; writes fail with the offline message
+- [ ] Second build with the same worker: a normal refresh loads the new app, no forced reload
+- [ ] Bumping `CACHE` in `sw.js` removes the old `homie-public-*` cache after activation
+- [ ] Installed-app auth spike → `docs/superpowers/spikes/mobile-pwa-auth.md`
+
 ## Results
 
 Record the actual test origin, API target (local or AWS), deployment/tunnel owner, test date, pass/fail results, and blockers after device checks. Do not record credentials, access tokens, or private user data. No device acceptance results are claimed until these checks have actually been run.
