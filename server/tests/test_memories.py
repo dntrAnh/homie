@@ -83,11 +83,11 @@ def client(
     app_client: TestClient,
     ddb_table: str,
     monkeypatch: pytest.MonkeyPatch,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
 ) -> Iterator[TestClient]:
     global _test_issuer, _test_signing_key
-    _test_issuer = fake_jwks_endpoint
+    _test_issuer = fake_jwks_issuer
     _test_signing_key = test_signing_key
     monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_requests=120))
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))

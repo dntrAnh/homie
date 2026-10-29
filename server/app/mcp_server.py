@@ -9,7 +9,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import CallToolResult, InputRequiredResult
-from pydantic import PlainValidator, ValidationError, WithJsonSchema
+from pydantic import ValidationError, WithJsonSchema
 
 from app.config import settings
 from app.models.memory import ChangeResult, Kind, MemoryCreate, RecalledMemory, RecallResult
@@ -33,11 +33,6 @@ def _user_sub(ctx: Context) -> str:
 
 def _storage_unavailable() -> ToolError:
     return ToolError("Memory storage is unavailable. Please try again shortly.")
-
-
-def _preserve_literal(value: Any) -> Any:
-    # The SDK JSON-parses string arguments unless their Pydantic field type is str.
-    return value
 
 
 class MemoryMCPServer(MCPServer):
@@ -68,7 +63,6 @@ def remember(
     ctx: Context,
     content: Annotated[
         str,
-        PlainValidator(_preserve_literal),
         WithJsonSchema({"type": "string", "maxLength": 2000}),
     ],
     kind: Annotated[str, WithJsonSchema({"type": "string", "enum": list(_KINDS)})] = "fact",
@@ -88,8 +82,7 @@ def remember(
         ),
     ] = None,
     event_id: Annotated[
-        str,
-        PlainValidator(_preserve_literal),
+        str | None,
         WithJsonSchema({"anyOf": [{"type": "string", "maxLength": 1024}, {"type": "null"}]}),
     ] = None,
 ) -> ChangeResult:
@@ -116,7 +109,9 @@ def remember(
             user_sub, data.content, data.kind, data.tags, data.event_id
         )
     except AccountDeletingError as exc:
-        raise ToolError("Your Homie account is being deleted, so I can't save that.") from exc
+        raise ToolError(
+            "Your Homie account is being deleted, so the server can't make a save."
+        ) from exc
     except (BotoCoreError, ClientError, StorageError) as exc:
         raise _storage_unavailable() from exc
     return ChangeResult(status="success", memory_id=str(memory.id))
@@ -125,9 +120,7 @@ def remember(
 @mcp.tool()
 def recall(
     ctx: Context,
-    query: Annotated[
-        str, PlainValidator(_preserve_literal), WithJsonSchema({"type": "string", "maxLength": 200})
-    ],
+    query: Annotated[str, WithJsonSchema({"type": "string", "maxLength": 200})],
     kind: Annotated[str, WithJsonSchema({"type": "string", "enum": list(_KINDS)})] = None,
 ) -> RecallResult:
     """Find the linked user's memories, or list recent ones with a blank query."""
