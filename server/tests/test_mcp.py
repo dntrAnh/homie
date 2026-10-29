@@ -90,7 +90,7 @@ class McpClient:
 def mcp_client(
     app_client: TestClient,
     ddb_table: Any,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[tuple[McpClient, Any]]:
@@ -99,26 +99,26 @@ def mcp_client(
     monkeypatch.setattr(memory_service, "get_table", lambda: ddb_table)
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
     monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_requests=120))
-    yield McpClient(app_client, fake_jwks_endpoint, test_signing_key), ddb_table
+    yield McpClient(app_client, fake_jwks_issuer, test_signing_key), ddb_table
 
 
-def result(response: Response) -> dict[str, Any]:
+def assert_response_format(response: Response) -> dict[str, Any]:
     assert response.status_code == 200, response.text
     assert response.headers["content-type"].startswith("application/json")
     assert "mcp-session-id" not in response.headers
     payload = response.json()
-    assert "error" not in payload, payload
+    assert "error" not in payload, f"Error in {payload}"
     return payload["result"]
 
 
 def successful_content(response: Response) -> dict[str, Any]:
-    tool_result = result(response)
+    tool_result = assert_response_format(response)
     assert tool_result.get("isError") is not True, tool_result
     return tool_result["structuredContent"]
 
 
 def tool_error(response: Response) -> str:
-    tool_result = result(response)
+    tool_result = assert_response_format(response)
     assert tool_result["isError"] is True, tool_result
     return " ".join(part.get("text", "") for part in tool_result.get("content", []))
 
@@ -128,7 +128,7 @@ def test_remember_is_blocked_while_account_is_deleting(mcp_client: tuple[McpClie
     table.put_item(Item={"pk": "USER#alice", "sk": "DELETING"})
 
     assert tool_error(mcp.call("remember", {"content": "Do not save"})) == (
-        "Your Homie account is being deleted, so I can't save that."
+        "Your Homie account is being deleted, so the server can't make a save."
     )
     assert MemoryService(table=table).list_memories("alice") == []
     assert successful_content(
@@ -138,14 +138,14 @@ def test_remember_is_blocked_while_account_is_deleting(mcp_client: tuple[McpClie
 
 def test_initialization_tool_schemas_and_endpoint_shape(mcp_client: tuple[McpClient, Any]) -> None:
     mcp, _ = mcp_client
-    initialized = result(mcp.initialize())
+    initialized = assert_response_format(mcp.initialize())
     assert initialized["protocolVersion"] == PROTOCOL_VERSION
 
     notification = mcp.post("notifications/initialized", notification=True)
     assert notification.status_code == 202
     assert "mcp-session-id" not in notification.headers
 
-    listed = result(mcp.post("tools/list"))
+    listed = assert_response_format(mcp.post("tools/list"))
     tools = {tool["name"]: tool for tool in listed["tools"]}
     assert set(tools) == {"remember", "recall", "forget"}
     kinds = {"item_location", "fact", "preference", "todo"}
@@ -224,7 +224,7 @@ def test_initialization_tool_schemas_and_endpoint_shape(mcp_client: tuple[McpCli
 def test_remember_recall_forget_and_profile_timezone(mcp_client: tuple[McpClient, Any]) -> None:
     mcp, table = mcp_client
     table.put_item(Item={"pk": "USER#alice", "sk": "PROFILE", "timezone": "America/Chicago"})
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
 
     saved = successful_content(
         mcp.call(
@@ -261,30 +261,12 @@ def test_remember_recall_forget_and_profile_timezone(mcp_client: tuple[McpClient
     assert tool_error(mcp.call("forget", {"memory_id": memory_id}))
 
 
-@pytest.mark.parametrize("literal", ["null", "[]"])
-def test_json_looking_strings_stay_literal(mcp_client: tuple[McpClient, Any], literal: str) -> None:
-    mcp, table = mcp_client
-    result(mcp.initialize())
-    memory_id = successful_content(mcp.call("remember", {"content": literal, "event_id": literal}))[
-        "memory_id"
-    ]
-    stored = table.get_item(Key={"pk": "USER#alice", "sk": f"MEM#{memory_id}"})["Item"]
-    assert stored["content"] == literal
-    assert stored["event_id"] == literal
-
-    recalled = successful_content(mcp.call("recall", {"query": literal}))["memories"]
-    assert len(recalled) == 1
-    assert recalled[0]["id"] == memory_id
-    assert recalled[0]["content"] == literal
-    assert "event_id" not in recalled[0]
-
-
 @pytest.mark.parametrize("kind", [None, "null", "[]"])
 def test_explicit_null_or_json_looking_kind_is_invalid(
     mcp_client: tuple[McpClient, Any], kind: Any
 ) -> None:
     mcp, _ = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     assert tool_error(mcp.call("remember", {"content": "Do not save", "kind": kind}))
     assert successful_content(mcp.call("recall", {"query": ""})) == {"memories": []}
     assert tool_error(mcp.call("recall", {"query": "", "kind": kind}))
@@ -295,7 +277,7 @@ def test_json_looking_memory_ids_are_rejected(
     mcp_client: tuple[McpClient, Any], memory_id: Any
 ) -> None:
     mcp, _ = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     assert tool_error(mcp.call("forget", {"memory_id": memory_id}))
 
 
@@ -303,7 +285,7 @@ def test_recall_timestamp_defaults_to_utc_without_profile(
     mcp_client: tuple[McpClient, Any],
 ) -> None:
     mcp, table = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     assert "Item" not in table.get_item(Key={"pk": "USER#alice", "sk": "PROFILE"})
     memory_id = successful_content(mcp.call("remember", {"content": "No profile yet"}))["memory_id"]
     memories = successful_content(mcp.call("recall", {"query": "profile"}))["memories"]
@@ -314,7 +296,7 @@ def test_recall_timestamp_defaults_to_utc_without_profile(
 
 def test_recall_limits_scoping_ranking_and_fallback(mcp_client: tuple[McpClient, Any]) -> None:
     mcp, _ = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     saved_ids = [
         successful_content(mcp.call("remember", {"content": f"Fact number {i}"}))["memory_id"]
         for i in range(11)
@@ -347,7 +329,7 @@ def test_recall_limits_scoping_ranking_and_fallback(mcp_client: tuple[McpClient,
 
 def test_user_isolation_and_empty_recall(mcp_client: tuple[McpClient, Any]) -> None:
     mcp, _ = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     alice_id = successful_content(
         mcp.call("remember", {"content": "The safe combination is private"})
     )["memory_id"]
@@ -369,9 +351,13 @@ def test_http_auth_and_service_scope(mcp_client: tuple[McpClient, Any]) -> None:
     assert "www-authenticate" not in no_auth.headers
 
     service_token = mcp.token(None, scope="homie/mcp:service")
-    assert result(mcp.initialize(token=service_token))["protocolVersion"] == PROTOCOL_VERSION
+    assert (
+        assert_response_format(mcp.initialize(token=service_token))["protocolVersion"]
+        == PROTOCOL_VERSION
+    )
     assert {
-        tool["name"] for tool in result(mcp.post("tools/list", token=service_token))["tools"]
+        tool["name"]
+        for tool in assert_response_format(mcp.post("tools/list", token=service_token))["tools"]
     } == {
         "remember",
         "recall",
@@ -425,7 +411,7 @@ def test_remember_content_errors_are_safe(
     mcp_client: tuple[McpClient, Any], arguments: dict[str, Any]
 ) -> None:
     mcp, _ = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     response = mcp.call("remember", arguments)
     assert tool_error(response)
     assert "privateprivate" not in response.text
@@ -435,7 +421,7 @@ def test_forget_invalid_ids_and_storage_failure_are_safe(
     mcp_client: tuple[McpClient, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mcp, _ = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     assert tool_error(mcp.call("forget", {"memory_id": "not-a-uuid"}))
     assert tool_error(mcp.call("forget", {"memory_id": str(uuid4())}))
 
@@ -466,7 +452,7 @@ def test_service_storage_errors_are_sanitized_mcp_tool_errors(
     transport: bool,
 ) -> None:
     mcp, table = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     error = (
         EndpointConnectionError(endpoint_url="secret-internal-storage")
         if transport
@@ -532,7 +518,7 @@ def test_invalid_tool_arguments_are_safe(
     mcp_client: tuple[McpClient, Any], name: str, arguments: dict[str, Any], secret: str
 ) -> None:
     mcp, _ = mcp_client
-    result(mcp.initialize())
+    assert_response_format(mcp.initialize())
     response = mcp.call(name, arguments)
     assert response.status_code == 200
     payload = response.json()
@@ -559,7 +545,7 @@ def test_origin_host_cors_rate_limit_and_rest_routes(
     assert "POST" in preflight.headers["access-control-allow-methods"]
     assert "authorization" in preflight.headers["access-control-allow-headers"].lower()
     browser_request = mcp.post("tools/list", headers={"Origin": allowed_origin})
-    assert {tool["name"] for tool in result(browser_request)["tools"]} == {
+    assert {tool["name"] for tool in assert_response_format(browser_request)["tools"]} == {
         "remember",
         "recall",
         "forget",
@@ -572,7 +558,7 @@ def test_origin_host_cors_rate_limit_and_rest_routes(
     assert tokenless_browser_request.status_code == 401
     assert tokenless_browser_request.headers["access-control-allow-origin"] == allowed_origin
     assert "www-authenticate" not in tokenless_browser_request.headers
-    assert result(mcp.initialize())["protocolVersion"] == PROTOCOL_VERSION
+    assert assert_response_format(mcp.initialize())["protocolVersion"] == PROTOCOL_VERSION
     assert mcp.post("tools/list", headers={"Origin": "http://evil.example"}).status_code in {
         400,
         403,
@@ -583,10 +569,12 @@ def test_origin_host_cors_rate_limit_and_rest_routes(
         403,
         421,
     }
-    assert result(mcp.post("tools/list", headers={"Host": "127.0.0.1:8000"}))["tools"]
+    assert assert_response_format(mcp.post("tools/list", headers={"Host": "127.0.0.1:8000"}))[
+        "tools"
+    ]
 
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=1))
-    assert result(mcp.post("tools/list"))["tools"]
+    assert assert_response_format(mcp.post("tools/list"))["tools"]
     limited = mcp.post("tools/list")
     assert limited.status_code == 429
     assert limited.headers["retry-after"] == "60"

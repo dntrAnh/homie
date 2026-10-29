@@ -74,7 +74,7 @@ def signed_token(
 def simulator_client(
     app_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
 ) -> Iterator[TestClient]:
     monkeypatch.setattr(main.app.state, "api_rate_limiter", RateLimiter(max_requests=120))
     monkeypatch.setattr(
@@ -228,11 +228,11 @@ def test_simulator_service_errors_have_one_typed_boundary() -> None:
 
 def test_chat_route_forwards_exact_authenticated_token(
     simulator_client: TestClient,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    token = signed_token(fake_jwks_endpoint, test_signing_key)
+    token = signed_token(fake_jwks_issuer, test_signing_key)
     captured: dict[str, Any] = {}
 
     async def fake_run_chat(messages: list[Any], access_token: str) -> ChatReply:
@@ -265,7 +265,7 @@ def test_chat_route_forwards_exact_authenticated_token(
 )
 def test_chat_route_requires_linked_user_tools_token(
     simulator_client: TestClient,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
     headers: dict[str, Any],
@@ -281,7 +281,7 @@ def test_chat_route_requires_linked_user_tools_token(
     request_headers: dict[str, str] = {}
     if headers:
         token = signed_token(
-            fake_jwks_endpoint,
+            fake_jwks_issuer,
             test_signing_key,
             headers["user_sub"],
             scope=headers["scope"],
@@ -301,7 +301,7 @@ def test_chat_route_requires_linked_user_tools_token(
 
 def test_chat_route_rejects_invalid_body_before_service(
     simulator_client: TestClient,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -315,7 +315,7 @@ def test_chat_route_rejects_invalid_body_before_service(
     monkeypatch.setattr(simulator_route, "run_chat", fake_run_chat)
     response = simulator_client.post(
         "/api/simulator/chat",
-        headers={"Authorization": f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key)}"},
+        headers={"Authorization": f"Bearer {signed_token(fake_jwks_issuer, test_signing_key)}"},
         json={"messages": [message("user", " ")]},
     )
 
@@ -349,7 +349,7 @@ def test_chat_route_rejects_invalid_body_before_service(
 )
 def test_chat_route_maps_typed_errors_without_leaking_details(
     simulator_client: TestClient,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -362,7 +362,7 @@ def test_chat_route_maps_typed_errors_without_leaking_details(
         raise error
 
     monkeypatch.setattr(simulator_route, "run_chat", fake_run_chat)
-    token = signed_token(fake_jwks_endpoint, test_signing_key)
+    token = signed_token(fake_jwks_issuer, test_signing_key)
     caplog.set_level(logging.WARNING, logger=simulator_route.__name__)
     response = simulator_client.post(
         "/api/simulator/chat",
@@ -391,7 +391,7 @@ def test_chat_route_maps_typed_errors_without_leaking_details(
 
 def test_chat_minute_rate_limit_is_per_user_and_stops_service(
     simulator_client: TestClient,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -406,10 +406,10 @@ def test_chat_minute_rate_limit_is_per_user_and_stops_service(
     monkeypatch.setattr(
         main.app.state, "simulator_minute_rate_limiter", RateLimiter(max_requests=1)
     )
-    alice = {"Authorization": f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key)}"}
+    alice = {"Authorization": f"Bearer {signed_token(fake_jwks_issuer, test_signing_key)}"}
     bob = {
         "Authorization": (
-            f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key, user_sub='bob')}"
+            f"Bearer {signed_token(fake_jwks_issuer, test_signing_key, user_sub='bob')}"
         )
     }
 
@@ -435,7 +435,7 @@ def test_chat_minute_rate_limit_is_per_user_and_stops_service(
 
 def test_chat_daily_rate_limit_has_daily_retry_after(
     simulator_client: TestClient,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -458,7 +458,7 @@ def test_chat_daily_rate_limit_has_daily_retry_after(
             detail="Simulator rolling 24-hour limit reached. Please try again later.",
         ),
     )
-    headers = {"Authorization": f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key)}"}
+    headers = {"Authorization": f"Bearer {signed_token(fake_jwks_issuer, test_signing_key)}"}
 
     assert (
         simulator_client.post(
@@ -816,11 +816,11 @@ def test_mcp_tool_client_maps_protocol_errors_and_timeouts(
 def test_mcp_boundary_uses_forwarded_token_and_real_in_process_endpoint(
     app_client: TestClient,
     ddb_table: Any,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    token = signed_token(fake_jwks_endpoint, test_signing_key)
+    token = signed_token(fake_jwks_issuer, test_signing_key)
     captured: dict[str, str] = {}
     monkeypatch.setattr(memory_service, "get_table", lambda: ddb_table)
     monkeypatch.setattr(main.app.state, "mcp_rate_limiter", RateLimiter(max_requests=60))
@@ -1231,7 +1231,7 @@ def test_run_chat_returns_partial_reply_on_timeout_after_confirmed_call(
 def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
     simulator_client: TestClient,
     ddb_table: Any,
-    fake_jwks_endpoint: str,
+    fake_jwks_issuer: str,
     test_signing_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1309,12 +1309,10 @@ def test_simulator_end_to_end_scopes_real_mcp_workflow_to_forwarded_user(
         )
 
     monkeypatch.setattr(simulator_service, "_create_mcp_http_client", in_process_mcp_client)
-    alice_headers = {
-        "Authorization": f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key)}"
-    }
+    alice_headers = {"Authorization": f"Bearer {signed_token(fake_jwks_issuer, test_signing_key)}"}
     bob_headers = {
         "Authorization": (
-            f"Bearer {signed_token(fake_jwks_endpoint, test_signing_key, user_sub='bob')}"
+            f"Bearer {signed_token(fake_jwks_issuer, test_signing_key, user_sub='bob')}"
         )
     }
 

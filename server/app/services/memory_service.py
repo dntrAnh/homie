@@ -193,6 +193,7 @@ class MemoryService:
                 "payload_hash": self._payload_hash(data),
                 "created_at": now_iso,
             }
+            # Fast replay path; the transaction handler below covers concurrent first requests.
             existing = self.table.get_item(
                 Key={"pk": request_item["pk"], "sk": request_sk}, ConsistentRead=True
             ).get("Item")
@@ -291,6 +292,7 @@ class MemoryService:
         query_tokens = cls._tokens(query)
         if not query_tokens:
             return []
+        # Score each item by the number of distinct query tokens it shares.
         scored = [(len(query_tokens & cls._tokens(text(item))), item) for item in items]
         return [
             item
@@ -336,7 +338,7 @@ class MemoryService:
             query_kwargs["Limit"] = _MAX_ITEMS - len(items)
             response = self.table.query(**query_kwargs)
             items.extend(response.get("Items", []))
-            if "LastEvaluatedKey" not in response or len(items) >= _MAX_ITEMS:
+            if "LastEvaluatedKey" not in response:
                 break
             query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 

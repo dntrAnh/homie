@@ -38,7 +38,7 @@ def test_signing_key() -> rsa.RSAPrivateKey:
 
 
 @pytest.fixture
-def fake_jwks_endpoint(
+def fake_jwks_issuer(
     monkeypatch: pytest.MonkeyPatch, test_signing_key: rsa.RSAPrivateKey
 ) -> Iterator[str]:
     public_jwk = jwt.algorithms.RSAAlgorithm.to_jwk(test_signing_key.public_key(), as_dict=True)
