@@ -217,17 +217,32 @@ class MediaService:
         return self._to_medias([item], user_sub)[0]
 
     @storage_errors
-    def list_media(self, user_sub: str, limit: int = 50) -> list[Media]:
+    def list_media(
+        self, user_sub: str, limit: int = 50, *, memory_id: str | None = None
+    ) -> list[Media]:
         limit = _limit_adapter.validate_python(limit)
-        page = self.table.query(
-            KeyConditionExpression=Key("pk").eq(self._key(user_sub, "")["pk"])
+        query: dict[str, Any] = {
+            "KeyConditionExpression": Key("pk").eq(self._key(user_sub, "")["pk"])
             & Key("sk").begins_with("MEDIA#"),
-            ScanIndexForward=False,
-            ConsistentRead=True,
-            Limit=_LIST_SCAN_LIMIT,
-            FilterExpression=Attr("status").eq("uploaded"),
-        )
-        return self._to_medias(page.get("Items", [])[:limit], user_sub)
+            "ScanIndexForward": False,
+            "ConsistentRead": True,
+            "Limit": _LIST_SCAN_LIMIT,
+            "FilterExpression": Attr("status").eq("uploaded"),
+        }
+        if memory_id is not None:
+            memory_id = str(UUID(memory_id))
+            query["FilterExpression"] &= Attr("memory_id").eq(memory_id)
+
+        items: list[dict[str, Any]] = []
+        while len(items) < limit:
+            page = self.table.query(**query)
+            items.extend(page.get("Items", []))
+            last_key = page.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query["ExclusiveStartKey"] = last_key
+
+        return self._to_medias(items[:limit], user_sub)
 
     @storage_errors
     def update_media(self, user_sub: str, media_id: str, data: MediaUpdate) -> Media:
