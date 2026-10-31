@@ -45,8 +45,13 @@ def list_media(
     user: CurrentUserDependency,
     service: MediaServiceDependency,
     limit: Annotated[Limit, Query()] = 50,
+    memory_id: Annotated[UUID | None, Query()] = None,
 ) -> list[Media]:
-    return service.list_media(user.sub, limit)
+    return service.list_media(
+        user.sub,
+        limit,
+        memory_id=str(memory_id) if memory_id is not None else None,
+    )
 
 
 @router.patch("/{media_id}", response_model=Media)

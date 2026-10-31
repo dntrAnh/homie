@@ -58,6 +58,59 @@ export interface paths {
     patch: operations["update_memory_api_memories__memory_id__patch"]
     trace?: never
   }
+  "/api/media": {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    /** List Media */
+    get: operations["list_media_api_media_get"]
+    put?: never
+    /** Create Media */
+    post: operations["create_media_api_media_post"]
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
+  "/api/media/{media_id}/complete": {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    get?: never
+    put?: never
+    /** Complete Media */
+    post: operations["complete_media_api_media__media_id__complete_post"]
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
+  "/api/media/{media_id}": {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    get?: never
+    put?: never
+    post?: never
+    /** Delete Media */
+    delete: operations["delete_media_api_media__media_id__delete"]
+    options?: never
+    head?: never
+    /** Update Media */
+    patch: operations["update_media_api_media__media_id__patch"]
+    trace?: never
+  }
   "/api/me/profile": {
     parameters: {
       query?: never
@@ -180,6 +233,91 @@ export interface components {
       lat?: number | null
       /** Lng */
       lng?: number | null
+    }
+    /** Media */
+    Media: {
+      /**
+       * Id
+       * Format: uuid
+       */
+      id: string
+      /**
+       * Content Type
+       * @enum {string}
+       */
+      content_type:
+        | "image/jpeg"
+        | "image/png"
+        | "image/webp"
+        | "image/heic"
+        | "video/mp4"
+        | "video/quicktime"
+      /** Size */
+      size: number
+      /** Caption */
+      caption: string
+      /** Tags */
+      tags: string[]
+      /** Memory Id */
+      memory_id?: string | null
+      /** Training Consent */
+      training_consent: boolean
+      /**
+       * Status
+       * @enum {string}
+       */
+      status: "pending" | "uploaded"
+      /** Url */
+      url: string
+      /**
+       * Created At
+       * Format: date-time
+       */
+      created_at: string
+    }
+    /** MediaCreate */
+    MediaCreate: {
+      /**
+       * Content Type
+       * @enum {string}
+       */
+      content_type:
+        | "image/jpeg"
+        | "image/png"
+        | "image/webp"
+        | "image/heic"
+        | "video/mp4"
+        | "video/quicktime"
+      /** Size */
+      size: number
+      /**
+       * Caption
+       * @default
+       */
+      caption: string
+    }
+    /** MediaUpdate */
+    MediaUpdate: {
+      /** Caption */
+      caption?: string | null
+      /** Tags */
+      tags?: string[] | null
+      /** Memory Id */
+      memory_id?: string | null
+      /** Training Consent */
+      training_consent?: boolean | null
+    }
+    /** MediaUpload */
+    MediaUpload: {
+      media: components["schemas"]["Media"]
+      /** Upload Url */
+      upload_url: string
+      /** Upload Headers */
+      upload_headers: {
+        [key: string]: string
+      }
+      /** Expires In */
+      expires_in: number
     }
     /** Memory */
     Memory: {
@@ -513,6 +651,173 @@ export interface operations {
         }
         content: {
           "application/json": components["schemas"]["Memory"]
+        }
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"]
+        }
+      }
+    }
+  }
+  list_media_api_media_get: {
+    parameters: {
+      query?: {
+        limit?: number
+        memory_id?: string | null
+      }
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    requestBody?: never
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["Media"][]
+        }
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"]
+        }
+      }
+    }
+  }
+  create_media_api_media_post: {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["MediaCreate"]
+      }
+    }
+    responses: {
+      /** @description Successful Response */
+      201: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["MediaUpload"]
+        }
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"]
+        }
+      }
+    }
+  }
+  complete_media_api_media__media_id__complete_post: {
+    parameters: {
+      query?: never
+      header?: never
+      path: {
+        media_id: string
+      }
+      cookie?: never
+    }
+    requestBody?: never
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["Media"]
+        }
+      }
+      /** @description Upload missing or does not match its declared metadata */
+      409: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"]
+        }
+      }
+    }
+  }
+  delete_media_api_media__media_id__delete: {
+    parameters: {
+      query?: never
+      header?: never
+      path: {
+        media_id: string
+      }
+      cookie?: never
+    }
+    requestBody?: never
+    responses: {
+      /** @description Successful Response */
+      204: {
+        headers: {
+          [name: string]: unknown
+        }
+        content?: never
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"]
+        }
+      }
+    }
+  }
+  update_media_api_media__media_id__patch: {
+    parameters: {
+      query?: never
+      header?: never
+      path: {
+        media_id: string
+      }
+      cookie?: never
+    }
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["MediaUpdate"]
+      }
+    }
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          "application/json": components["schemas"]["Media"]
         }
       }
       /** @description Validation Error */

@@ -174,6 +174,103 @@ def test_complete_list_patch_delete(media_client: TestClient, media_service: Med
         media_service.s3.head_object(Bucket=settings.media_bucket, Key=item["s3_key"])
 
 
+def test_list_media_by_memory_filters_and_validates(
+    media_client: TestClient, media_service: MediaService
+) -> None:
+    memories = MemoryService(table=media_service.table)
+    target = memories.create_memory("alice", "Keys", "fact", [])
+    other = memories.create_memory("alice", "Passport", "fact", [])
+
+    def linked_upload(memory_id: Any) -> str:
+        media_id = create(media_client)["media"]["id"]
+        media_service.update_media("alice", media_id, MediaUpdate(memory_id=memory_id))
+        upload(media_service, media_id)
+        media_service.complete_media("alice", media_id)
+        return media_id
+
+    matches = [linked_upload(target.id), linked_upload(target.id)]
+    linked_upload(other.id)
+
+    pending = create(media_client)["media"]["id"]
+    media_service.update_media("alice", pending, MediaUpdate(memory_id=target.id))
+    deleting = create(media_client)["media"]["id"]
+    media_service.update_media("alice", deleting, MediaUpdate(memory_id=target.id))
+    media_service.table.update_item(
+        Key={"pk": "USER#alice", "sk": f"MEDIA#{deleting}"},
+        UpdateExpression="SET #status = :deleting",
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={":deleting": "deleting"},
+    )
+
+    matched_item = media_service._get("alice", matches[0])
+    foreign_id = str(uuid7())
+    media_service.table.put_item(
+        Item={
+            **matched_item,
+            "pk": "USER#bob",
+            "sk": f"MEDIA#{foreign_id}",
+            "id": foreign_id,
+            "s3_key": f"users/bob/media/{foreign_id}.jpg",
+        }
+    )
+
+    response = media_client.get(f"/api/media?memory_id={target.id}&limit=10", headers=auth())
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    returned = response.json()
+    assert {item["id"] for item in returned} == set(matches)
+    assert foreign_id not in {item["id"] for item in returned}
+    assert all(item["memory_id"] == str(target.id) for item in returned)
+
+    missing = media_client.get(f"/api/media?memory_id={uuid4()}", headers=auth())
+    assert missing.status_code == 200
+    assert missing.json() == []
+    assert media_client.get("/api/media?memory_id=not-a-uuid", headers=auth()).status_code == 422
+    assert (
+        media_client.get(f"/api/media?memory_id={target.id}&limit=201", headers=auth()).status_code
+        == 422
+    )
+
+
+@pytest.mark.parametrize("filter_by_memory", [False, True])
+def test_list_media_paginates_past_filtered_pages(
+    media_service: MediaService,
+    monkeypatch: pytest.MonkeyPatch,
+    filter_by_memory: bool,
+) -> None:
+    # create 2 memories, 1 media and link that media to "target" memory
+    memories = MemoryService(table=media_service.table)
+    target = memories.create_memory("alice", "Keys", "fact", [])
+    other = memories.create_memory("alice", "Passport", "fact", [])
+    result = media_service.create_media("alice", MediaCreate(content_type="image/jpeg", size=4))
+    target_id = str(result.media.id)
+    media_service.update_media("alice", target_id, MediaUpdate(memory_id=target.id))
+    item = upload(media_service, target_id)
+    media_service.complete_media("alice", target_id)
+
+    with media_service.table.batch_writer() as batch:
+        for _ in range(201):
+            media_id = str(uuid7())
+            batch.put_item(
+                Item={
+                    **item,
+                    "id": media_id,
+                    "sk": f"MEDIA#{media_id}",
+                    "s3_key": f"users/alice/media/{media_id}.jpg",
+                    "memory_id": str(other.id),
+                    "status": "uploaded" if filter_by_memory else "pending",
+                }
+            )
+
+    query = Mock(wraps=media_service.table.query)
+    monkeypatch.setattr(media_service.table, "query", query)
+    options = {"memory_id": str(target.id)} if filter_by_memory else {}
+    listed = media_service.list_media("alice", 1, **options)
+    assert [str(media.id) for media in listed] == [target_id]
+    # expect call_count to be 2 cause we have 2 pagination
+    assert query.call_count == 2
+
+
 def test_complete_missing_or_mismatched_object(
     media_client: TestClient, media_service: MediaService
 ) -> None:
@@ -456,7 +553,7 @@ def test_pagination_order_cleanup_boundary_and_timezone(
     item = upload(media_service, oldest)
     media_service.complete_media("alice", oldest)
     ids = []
-    # A full filtered-out page must not trigger another query on the read path.
+    # A full filtered-out page must not hide an uploaded record on a later page.
     with media_service.table.batch_writer() as batch:
         for _ in range(201):
             media_id = str(uuid7())
@@ -483,8 +580,8 @@ def test_pagination_order_cleanup_boundary_and_timezone(
         )
     query = Mock(wraps=media_service.table.query)
     monkeypatch.setattr(media_service.table, "query", query)
-    assert media_service.list_media("alice", 1) == []
-    assert query.call_count == 1
+    assert [str(media.id) for media in media_service.list_media("alice", 1)] == [oldest]
+    assert query.call_count == 2
     # Maintenance pages are bounded, even when all records fail a status filter.
     for _ in range(4):
         media_service.maintain("alice", 200)
@@ -497,7 +594,7 @@ def test_pagination_order_cleanup_boundary_and_timezone(
         Item={"pk": "USER#alice", "sk": "PROFILE", "timezone": "America/New_York"}
     )
     listed = media_service.list_media("alice", 2)
-    assert [str(media.id) for media in listed] == [newest]
+    assert [str(media.id) for media in listed] == [newest, oldest]
     assert listed[0].created_at.utcoffset() == timedelta(hours=-4)
 
 
