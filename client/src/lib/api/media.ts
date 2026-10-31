@@ -51,6 +51,21 @@ export function useMedia() {
   })
 }
 
+export function useMemoryMedia(memoryId: string | undefined) {
+  const { request, sub, enabled } = useApi()
+  return useQuery({
+    queryKey: [sub, "media", "memory", memoryId],
+    enabled: enabled && Boolean(memoryId),
+    queryFn: ({ signal }) =>
+      request<MediaItem[]>(
+        `/api/media?memory_id=${encodeURIComponent(memoryId!)}&limit=200`,
+        { signal },
+      ),
+    // Presigned GETs expire after 15 min; refresh well before that.
+    staleTime: 5 * 60_000,
+  })
+}
+
 export function useUpdateMedia() {
   const { request, sub } = useApi()
   const qc = useQueryClient()

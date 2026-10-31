@@ -7,8 +7,6 @@ import {
   ChevronDown,
   Clock3,
   CalendarPlus,
-  Image as ImageIcon,
-  Paperclip,
   RefreshCw,
   Trash2,
   X,
@@ -32,6 +30,7 @@ import { formatStamp } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 import { KIND_ORDER, KINDS } from "./kinds"
+import { MemoryAttachments } from "./memory-attachments"
 
 const MAX_TAGS = 20
 const fieldLabel =
@@ -281,40 +280,7 @@ export function MemoryEditor({ memory }: { memory?: Memory }) {
               </div>
             </div>
 
-            <div className="space-y-2.5">
-              <div className="hidden items-center justify-between md:flex">
-                <span className={fieldLabel}>Attachments</span>
-                <Link
-                  href="/media"
-                  className="text-accent-dark inline-flex items-center gap-1.5 text-xs font-semibold hover:underline"
-                >
-                  <Paperclip className="size-4" aria-hidden /> Add photo or
-                  video
-                </Link>
-              </div>
-              <div className="bg-muted flex items-center gap-4 rounded-lg border px-4 py-4.5">
-                <ImageIcon
-                  className="text-muted-foreground size-5 shrink-0"
-                  aria-hidden
-                />
-                <div className="min-w-0">
-                  <p className="text-[13px] font-semibold">
-                    {memory?.media_ids.length
-                      ? `${memory.media_ids.length} attached`
-                      : "No media attached"}
-                  </p>
-                  <p className="text-muted-foreground hidden text-xs md:block">
-                    A photo can make this memory easier to recognize.
-                  </p>
-                  <Link
-                    href="/media"
-                    className="text-accent-dark text-[11px] font-medium md:hidden"
-                  >
-                    Add photo or video
-                  </Link>
-                </div>
-              </div>
-            </div>
+            <MemoryAttachments memoryId={memory?.id} />
 
             {memory && (
               <p className="text-muted-foreground flex items-center gap-2 border-y py-3 text-xs md:hidden">
